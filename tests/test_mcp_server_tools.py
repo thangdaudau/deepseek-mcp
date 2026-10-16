@@ -32,37 +32,57 @@ async def test_server_tools_registered():
 
 def test_ask_session_lifecycle():
     import json
-    from server import ASK_SESSIONS, deepseek_session_clear, cleanup_expired_sessions
+    import os
+    from server import (
+        save_session,
+        load_session,
+        delete_session,
+        delete_all_sessions,
+        deepseek_session_clear,
+        get_session_file
+    )
     
-    # Clean slate
-    ASK_SESSIONS.clear()
+    session_id = "test-disk-session-1"
+    file_path = get_session_file(session_id)
     
-    # Emulate session creation
-    session_id = "test-session-1"
-    ASK_SESSIONS[session_id] = {
+    # 1. Clean slate
+    delete_session(session_id)
+    assert not os.path.exists(file_path)
+    
+    # 2. Save session to disk
+    session_data = {
+        "session_id": session_id,
         "messages": [
             {"role": "system", "content": "system instruction"},
             {"role": "user", "content": "turn 1 question"},
             {"role": "assistant", "content": "turn 1 answer"}
         ],
         "system_prompt": "system instruction",
-        "updated_at": 1000.0,
-        "created_at": 1000.0,
+        "updated_at": 2000000000.0,
+        "created_at": 2000000000.0,
         "turn_count": 1
     }
+    save_session(session_id, session_data)
+    assert os.path.exists(file_path)
     
-    assert session_id in ASK_SESSIONS
-    assert len(ASK_SESSIONS[session_id]["messages"]) == 3
+    # 3. Load session from disk (survives restart)
+    loaded = load_session(session_id)
+    assert loaded is not None
+    assert loaded["session_id"] == session_id
+    assert len(loaded["messages"]) == 3
     
-    # Test specific session clear
+    # 4. Clear single session tool
     clear_res = json.loads(deepseek_session_clear(session_id))
     assert clear_res["status"] == "SUCCESS"
-    assert session_id not in ASK_SESSIONS
+    assert not os.path.exists(file_path)
+    assert load_session(session_id) is None
     
-    # Test clearing all
-    ASK_SESSIONS["s1"] = {"updated_at": 1000.0}
-    ASK_SESSIONS["s2"] = {"updated_at": 1000.0}
+    # 5. Clear all sessions tool
+    save_session("s1", {"messages": [], "updated_at": 2000000000.0})
+    save_session("s2", {"messages": [], "updated_at": 2000000000.0})
     clear_all_res = json.loads(deepseek_session_clear(None))
     assert clear_all_res["status"] == "SUCCESS"
-    assert len(ASK_SESSIONS) == 0
+    assert load_session("s1") is None
+    assert load_session("s2") is None
+
 

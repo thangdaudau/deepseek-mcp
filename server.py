@@ -113,25 +113,82 @@ def extract_telemetry(response_usage: Any) -> Dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Session Manager for Stateful Multi-Turn Conversations
+# Session Manager for Stateful Multi-Turn Conversations (File-based Persistence)
 # ---------------------------------------------------------------------------
-ASK_SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SECONDS = 3600  # 1 hour
-MAX_SESSIONS = 50
+SESSIONS_DIR = os.path.expanduser("~/.local/share/deepseek-mcp/sessions")
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+SESSION_TTL_SECONDS = 86400  # 24 hours (1 ngày)
+
+def get_session_file(session_id: str) -> str:
+    """Tạo đường dẫn an toàn cho session file, chặn path traversal."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)
+    return os.path.join(SESSIONS_DIR, f"{safe_id}.json")
+
+def load_session(session_id: str) -> Optional[Dict[str, Any]]:
+    """Tải session từ đĩa, tự hủy nếu quá hạn TTL."""
+    file_path = get_session_file(session_id)
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if time.time() - data.get("updated_at", 0) > SESSION_TTL_SECONDS:
+                os.remove(file_path)
+                return None
+            return data
+        except Exception:
+            return None
+    return None
+
+def save_session(session_id: str, data: Dict[str, Any]) -> None:
+    """Ghi bền vững session xuống file JSON trên đĩa."""
+    file_path = get_session_file(session_id)
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def delete_session(session_id: str) -> bool:
+    """Xóa file session chỉ định trên đĩa."""
+    file_path = get_session_file(session_id)
+    if os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            return True
+        except Exception:
+            pass
+    return False
+
+def delete_all_sessions() -> int:
+    """Xóa sạch toàn bộ session trên đĩa."""
+    if not os.path.exists(SESSIONS_DIR):
+        return 0
+    count = 0
+    for fname in os.listdir(SESSIONS_DIR):
+        if fname.endswith(".json"):
+            try:
+                os.remove(os.path.join(SESSIONS_DIR, fname))
+                count += 1
+            except Exception:
+                pass
+    return count
 
 def cleanup_expired_sessions() -> None:
-    """Tự động dọn dẹp các session quá hạn (TTL) hoặc vượt quá giới hạn bộ nhớ."""
+    """Tự động dọn dẹp các session quá hạn TTL (24h) trên đĩa."""
+    if not os.path.exists(SESSIONS_DIR):
+        return
     now = time.time()
-    expired = [
-        sid for sid, data in ASK_SESSIONS.items()
-        if now - data.get("updated_at", now) > SESSION_TTL_SECONDS
-    ]
-    for sid in expired:
-        ASK_SESSIONS.pop(sid, None)
-    if len(ASK_SESSIONS) > MAX_SESSIONS:
-        sorted_sids = sorted(ASK_SESSIONS.keys(), key=lambda s: ASK_SESSIONS[s].get("updated_at", 0))
-        for sid in sorted_sids[:len(ASK_SESSIONS) - MAX_SESSIONS]:
-            ASK_SESSIONS.pop(sid, None)
+    try:
+        for fname in os.listdir(SESSIONS_DIR):
+            if fname.endswith(".json"):
+                fpath = os.path.join(SESSIONS_DIR, fname)
+                try:
+                    if now - os.path.getmtime(fpath) > SESSION_TTL_SECONDS:
+                        os.remove(fpath)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Tool 1: deepseek_ask (Trực tiếp suy luận hoặc truy vấn DeepSeek Flash)
@@ -146,7 +203,7 @@ def deepseek_ask(
     system_prompt: Optional[str] = None
 ) -> str:
     """
-    Truy vấn DeepSeek-Flash, hỗ trợ Stateful Multi-turn (giữ ngữ cảnh liên tục qua session_id) 
+    Truy vấn DeepSeek-Flash, hỗ trợ Stateful Multi-turn bền vững (lưu trữ JSON trên đĩa qua session_id) 
     và 1-shot (session_id=None). Tận dụng tối đa KV Cache Prefix Matching trên GPU cluster.
     
     Args:
@@ -165,10 +222,15 @@ def deepseek_ask(
         "Be precise, rigorous, and truthful."
     )
     
+    session = None
     if session_id:
-        if reset_session or session_id not in ASK_SESSIONS:
+        if not reset_session:
+            session = load_session(session_id)
+            
+        if not session:
             initial_sys = system_prompt or default_sys
-            ASK_SESSIONS[session_id] = {
+            session = {
+                "session_id": session_id,
                 "messages": [{"role": "system", "content": initial_sys}],
                 "system_prompt": initial_sys,
                 "updated_at": time.time(),
@@ -176,7 +238,6 @@ def deepseek_ask(
                 "turn_count": 0
             }
         
-        session = ASK_SESSIONS[session_id]
         session["messages"].append({"role": "user", "content": prompt})
         session["updated_at"] = time.time()
         session["turn_count"] += 1
@@ -213,12 +274,13 @@ def deepseek_ask(
         telemetry = extract_telemetry(response.usage)
         telemetry["elapsed_seconds"] = elapsed
         
-        if session_id and session_id in ASK_SESSIONS:
-            ASK_SESSIONS[session_id]["messages"].append({
+        if session_id and session:
+            session["messages"].append({
                 "role": "assistant",
                 "content": content
             })
-            ASK_SESSIONS[session_id]["updated_at"] = time.time()
+            session["updated_at"] = time.time()
+            save_session(session_id, session)
             
         result = {
             "session_id": session_id,
@@ -235,29 +297,30 @@ def deepseek_ask(
             
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
-        if session_id and session_id in ASK_SESSIONS:
-            if ASK_SESSIONS[session_id]["messages"] and ASK_SESSIONS[session_id]["messages"][-1]["role"] == "user":
-                ASK_SESSIONS[session_id]["messages"].pop()
-                ASK_SESSIONS[session_id]["turn_count"] -= 1
+        if session_id and session:
+            if session["messages"] and session["messages"][-1]["role"] == "user":
+                session["messages"].pop()
+                session["turn_count"] -= 1
+                save_session(session_id, session)
         return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
 
 @server.tool()
 def deepseek_session_clear(session_id: Optional[str] = None) -> str:
     """
-    Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask.
+    Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask trên đĩa.
     
     Args:
-        session_id: ID của session cần xóa. Nếu None, xóa toàn bộ session.
+        session_id: ID của session cần xóa. Nếu None, xóa toàn bộ session trên đĩa.
     """
     if session_id:
-        if session_id in ASK_SESSIONS:
-            ASK_SESSIONS.pop(session_id, None)
-            return json.dumps({"status": "SUCCESS", "message": f"Session '{session_id}' đã được xóa."}, ensure_ascii=False)
-        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{session_id}' không tồn tại."}, ensure_ascii=False)
+        deleted = delete_session(session_id)
+        if deleted:
+            return json.dumps({"status": "SUCCESS", "message": f"Session '{session_id}' đã được xóa khỏi đĩa."}, ensure_ascii=False)
+        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{session_id}' không tồn tại trên đĩa."}, ensure_ascii=False)
     else:
-        count = len(ASK_SESSIONS)
-        ASK_SESSIONS.clear()
-        return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions."}, ensure_ascii=False)
+        count = delete_all_sessions()
+        return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
+
 
 
 # ---------------------------------------------------------------------------
