@@ -112,38 +112,83 @@ def extract_telemetry(response_usage: Any) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Session Manager for Stateful Multi-Turn Conversations
+# ---------------------------------------------------------------------------
+ASK_SESSIONS: Dict[str, Dict[str, Any]] = {}
+SESSION_TTL_SECONDS = 3600  # 1 hour
+MAX_SESSIONS = 50
+
+def cleanup_expired_sessions() -> None:
+    """Tự động dọn dẹp các session quá hạn (TTL) hoặc vượt quá giới hạn bộ nhớ."""
+    now = time.time()
+    expired = [
+        sid for sid, data in ASK_SESSIONS.items()
+        if now - data.get("updated_at", now) > SESSION_TTL_SECONDS
+    ]
+    for sid in expired:
+        ASK_SESSIONS.pop(sid, None)
+    if len(ASK_SESSIONS) > MAX_SESSIONS:
+        sorted_sids = sorted(ASK_SESSIONS.keys(), key=lambda s: ASK_SESSIONS[s].get("updated_at", 0))
+        for sid in sorted_sids[:len(ASK_SESSIONS) - MAX_SESSIONS]:
+            ASK_SESSIONS.pop(sid, None)
+
+# ---------------------------------------------------------------------------
 # Tool 1: deepseek_ask (Trực tiếp suy luận hoặc truy vấn DeepSeek Flash)
 # ---------------------------------------------------------------------------
 @server.tool()
 def deepseek_ask(
     prompt: str,
+    session_id: Optional[str] = None,
+    reset_session: bool = False,
     thinking: bool = True,
     effort: str = "high",
     system_prompt: Optional[str] = None
 ) -> str:
     """
-    Truy vấn trực tiếp DeepSeek-Flash, hỗ trợ cả Thinking Mode (với CoT) và Non-thinking Mode.
+    Truy vấn DeepSeek-Flash, hỗ trợ Stateful Multi-turn (giữ ngữ cảnh liên tục qua session_id) 
+    và 1-shot (session_id=None). Tận dụng tối đa KV Cache Prefix Matching trên GPU cluster.
     
     Args:
-        prompt: Nội dung câu hỏi / tác vụ.
+        prompt: Nội dung câu hỏi / lập luận phản biện.
+        session_id: Định danh phiên làm việc để duy trì ngữ cảnh multi-turn (ví dụ: 'adversarial-debate-1').
+        reset_session: Nếu True, xóa sạch ngữ cảnh cũ của session_id và bắt đầu hội thoại mới.
         thinking: Bật (True) hoặc tắt (False) Thinking Mode. Mặc định: True.
         effort: Mức độ suy luận CoT ('low', 'high', 'max'). Mặc định: 'high'.
-        system_prompt: Chỉ dẫn hệ thống tĩnh (được đặt ở đầu để tối ưu KV Cache).
+        system_prompt: Chỉ dẫn hệ thống tĩnh (được đặt ở đầu phiên để tối ưu KV Cache).
     """
     client = get_client()
-    messages: List[Dict[str, str]] = []
+    cleanup_expired_sessions()
     
-    # Giữ cố định system prompt ở đầu để tối ưu KV Cache Prefix Matching
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    else:
-        messages.append({
-            "role": "system",
-            "content": "You are an elite software architect and senior code engineer assisting on mission-critical production systems. Be precise, rigorous, and truthful."
-        })
+    default_sys = (
+        "You are an elite software architect and senior code engineer assisting on mission-critical production systems. "
+        "Be precise, rigorous, and truthful."
+    )
+    
+    if session_id:
+        if reset_session or session_id not in ASK_SESSIONS:
+            initial_sys = system_prompt or default_sys
+            ASK_SESSIONS[session_id] = {
+                "messages": [{"role": "system", "content": initial_sys}],
+                "system_prompt": initial_sys,
+                "updated_at": time.time(),
+                "created_at": time.time(),
+                "turn_count": 0
+            }
         
-    messages.append({"role": "user", "content": prompt})
-    
+        session = ASK_SESSIONS[session_id]
+        session["messages"].append({"role": "user", "content": prompt})
+        session["updated_at"] = time.time()
+        session["turn_count"] += 1
+        messages = session["messages"]
+        current_turn = session["turn_count"]
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt or default_sys},
+            {"role": "user", "content": prompt}
+        ]
+        current_turn = 1
+        
     kwargs: Dict[str, Any] = {
         "model": DEFAULT_MODEL,
         "messages": messages,
@@ -168,7 +213,16 @@ def deepseek_ask(
         telemetry = extract_telemetry(response.usage)
         telemetry["elapsed_seconds"] = elapsed
         
+        if session_id and session_id in ASK_SESSIONS:
+            ASK_SESSIONS[session_id]["messages"].append({
+                "role": "assistant",
+                "content": content
+            })
+            ASK_SESSIONS[session_id]["updated_at"] = time.time()
+            
         result = {
+            "session_id": session_id,
+            "turn": current_turn,
             "model": DEFAULT_MODEL,
             "mode": "thinking" if thinking else "non-thinking",
             "effort": effort if thinking else "none",
@@ -176,9 +230,35 @@ def deepseek_ask(
             "reasoning_content": reasoning if thinking else None,
             "telemetry": telemetry
         }
+        if session_id:
+            result["session_active_turns"] = current_turn
+            
         return json.dumps(result, ensure_ascii=False, indent=2)
     except Exception as e:
+        if session_id and session_id in ASK_SESSIONS:
+            if ASK_SESSIONS[session_id]["messages"] and ASK_SESSIONS[session_id]["messages"][-1]["role"] == "user":
+                ASK_SESSIONS[session_id]["messages"].pop()
+                ASK_SESSIONS[session_id]["turn_count"] -= 1
         return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
+
+@server.tool()
+def deepseek_session_clear(session_id: Optional[str] = None) -> str:
+    """
+    Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask.
+    
+    Args:
+        session_id: ID của session cần xóa. Nếu None, xóa toàn bộ session.
+    """
+    if session_id:
+        if session_id in ASK_SESSIONS:
+            ASK_SESSIONS.pop(session_id, None)
+            return json.dumps({"status": "SUCCESS", "message": f"Session '{session_id}' đã được xóa."}, ensure_ascii=False)
+        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{session_id}' không tồn tại."}, ensure_ascii=False)
+    else:
+        count = len(ASK_SESSIONS)
+        ASK_SESSIONS.clear()
+        return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions."}, ensure_ascii=False)
+
 
 # ---------------------------------------------------------------------------
 # Tool 2: deepseek_adversarial_review (Doubt-Driven Adversarial Code Review)
