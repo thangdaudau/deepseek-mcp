@@ -1,0 +1,5 @@
+mcp>=1.2.0
+openai>=1.60.0
+aider-chat>=0.70.0
+pydantic>=2.0.0
+pytest>=8.0.0

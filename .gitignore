@@ -1,0 +1,21 @@
+# Secrets & Sensitive configs
+.env
+*.env
+*.key
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+
+# Bytecode & Caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# IDE & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
