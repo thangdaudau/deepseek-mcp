@@ -564,17 +564,6 @@ def deepseek_code_task(
                 "content": str(tool_output)
             })
 
-        # Kiểm tra test chủ động sau khi đã ghi file
-        if test_cmd:
-            try:
-                quick_test = subprocess.run(test_cmd, shell=True, cwd=workspace, capture_output=True, text=True, timeout=30, env=exec_env)
-                if quick_test.returncode == 0:
-                    test_passed = True
-                    last_test_output = quick_test.stdout + quick_test.stderr
-                    break
-            except Exception:
-                pass
-
     # 4. Thu thập Git Diff (Bao gồm cả file mới tạo thông qua git add -A)
     git_diff = ""
     if is_git:
