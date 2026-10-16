@@ -89,7 +89,7 @@ def withdraw(account_id: str, amount: float):
     assert any(keyword in verdict_text.upper() for keyword in ["RACE", "CONCURRENCY", "OVERDRAFT", "THREAD", "NEGATIVE", "LOCK"])
     assert res["telemetry"]["reasoning_tokens"] > 0
 
-def test_live_code_task_harness_e2e():
+def test_live_code_task_e2e():
     with tempfile.TemporaryDirectory() as tmpdir:
         # Initialize a temporary git repository
         subprocess.run("git init -b main", shell=True, cwd=tmpdir, check=True, capture_output=True)
@@ -128,7 +128,7 @@ def test_live_code_task_harness_e2e():
         )
 
         report = json.loads(raw_report)
-        print(f"\nHarness E2E Report:\nStatus: {report.get('status')}\nTurns: {report.get('turns_executed')}")
+        print(f"\nCode Task E2E Report:\nStatus: {report.get('status')}\nTurns: {report.get('turns_executed')}")
         print(f"Git Diff:\n{report.get('git_diff_summary')}")
 
         assert report["status"] == "SUCCESS"

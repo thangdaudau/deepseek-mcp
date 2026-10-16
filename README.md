@@ -1,6 +1,6 @@
-# DeepSeek MCP Server & Agent Harness
+# DeepSeek MCP Server
 
-Hệ thống MCP Server tích hợp DeepSeek-Flash (V4.1) với Native Agent Harness, hỗ trợ Thinking Mode (CoT) linh hoạt, TDD test runner tự động và cơ chế phản biện gắt Doubt-Driven Development.
+Hệ thống MCP Server tích hợp DeepSeek-Flash (V4.1), hỗ trợ Thinking Mode (CoT) linh hoạt, TDD test runner tự động và cơ chế phản biện gắt Doubt-Driven Development.
 
 ## Vị trí cài đặt
 - **Mã nguồn Server:** `~/.local/share/deepseek-mcp/server.py`
@@ -18,7 +18,7 @@ Truy vấn trực tiếp DeepSeek-Flash:
 - `system_prompt` (string, optional): Chỉ dẫn hệ thống tĩnh để tối ưu KV Cache.
 
 ### 2. `deepseek_code_task`
-Agent Harness tự chủ thực hiện chu trình: **Lập Spec (Architect CoT)** -> **Sửa file & chạy test (Coder ReAct)** -> **Tự phản biện (Doubt Gate)**:
+Tự động thực hiện chu trình: **Lập Spec (Architect CoT)** -> **Sửa file & chạy test (Coder ReAct)** -> **Tự phản biện (Doubt Gate)**:
 - `workspace_dir` (string, required): Đường dẫn tuyệt đối thư mục dự án.
 - `task` (string, required): Mô tả bài toán cần làm.
 - `test_cmd` (string, optional): Lệnh chạy test tự động (ví dụ: `pytest tests/test_perf.py`).

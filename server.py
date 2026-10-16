@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DeepSeek MCP Server with Native Agent Harness (Aider-style ReAct Loop)
+DeepSeek MCP Server (ReAct Tool Loop & TDD Runner)
 Production-grade integration of DeepSeek Flash (Thinking/Non-thinking),
 automated TDD test runner, Doubt-Driven adversarial review, and safety guardrails.
 """
@@ -37,7 +37,7 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\b(chmod|chown)\s+-[rR]\s+777\s+(/|~)(\s|$)"
 ]
 
-server = MCPServer("DeepSeek-Agent-Harness")
+server = MCPServer("DeepSeek-MCP")
 
 def get_api_key() -> str:
     # 1. Direct env var
@@ -240,7 +240,7 @@ def deepseek_adversarial_review(
         return json.dumps({"error": f"Lỗi phản biện: {str(e)}"}, ensure_ascii=False)
 
 # ---------------------------------------------------------------------------
-# Tool 3: deepseek_code_task (Agent Harness: ReAct Loop, TDD & Self-Review)
+# Tool 3: deepseek_code_task (ReAct Loop, TDD Runner & Review)
 # ---------------------------------------------------------------------------
 LOCAL_TOOLS_SCHEMA = [
     {
@@ -431,7 +431,7 @@ def deepseek_code_task(
     max_turns: int = 12
 ) -> str:
     """
-    Thực thi tác vụ code tự chủ bằng DeepSeek Native Harness:
+    Thực thi tác vụ code tự động bằng DeepSeek TDD Loop:
     1. Tạo Safety Branch trong git.
     2. Architect Agent làm rõ yêu cầu & lập Spec (Thinking CoT Pre-Mortem).
     3. Coder Agent chạy ReAct Loop gọi tool sửa code & chạy test tự động.
