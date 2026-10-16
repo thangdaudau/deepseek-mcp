@@ -499,10 +499,6 @@ def deepseek_code_task(
     coder_system = (
         "You are an Autonomous Senior Software Engineer. You have access to local tools: read_file, write_file, edit_file_replace, run_shell, list_files. "
         "Follow the Architect's Spec strictly. Write or modify code in the workspace, and verify using the shell. "
-        "Strictly adhere to the Karpathy Guidelines: "
-        "(1) Simplicity First: Minimum code that solves the problem. No speculative abstractions or unrequested features. "
-        "(2) Surgical Changes: Touch only what you must. Prefer edit_file_replace. Do not reformat or modify unrelated code. "
-        "(3) Goal-Driven Execution: Transform tasks into verifiable goals and verify with tests. "
         "When finished, summarize your changes and state 'TASK_COMPLETE'."
     )
     
