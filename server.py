@@ -480,7 +480,7 @@ def deepseek_code_task(
         "The Coder is an execution worker who will follow your instructions step-by-step. Do not produce vague hand-waving advice.\n\n"
         "Your specification MUST strictly provide:\n"
         "1. TARGET FILES: Explicitly list which files to create or modify. Instruct Coder to touch ONLY these files and preserve existing style.\n"
-        "2. TEST SPECIFICATION: Define the exact test file to create/modify, the test cases/assertions, and the exact verification command (e.g. pytest command).\n"
+        "2. TEST SPECIFICATION: Define the exact test file to create/modify, the test cases/assertions, and the exact verification shell/bash command (e.g. test runner or execution command).\n"
         "3. MINIMAL IMPLEMENTATION: Design the simplest, most direct solution that solves the problem. Explicitly forbid unnecessary abstractions, design patterns, or unrequested flexibility.\n"
         "4. PRE-MORTEM & EDGE CASES: Identify subtle failure modes, boundary values, and race conditions so the Coder handles them directly.\n\n"
         "DO NOT use tool calls or DSML syntax. Output pure markdown blueprint only."
