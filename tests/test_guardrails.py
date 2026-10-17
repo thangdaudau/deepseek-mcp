@@ -126,10 +126,10 @@ def test_path_safety_denylist():
         assert safe is False
 
 def test_read_file_single_large_line():
-    """Kiểm tra đọc file 1 dòng duy nhất có kích thước 2MB mà không bị OOM hay treo."""
+    """Kiểm tra đọc file 1 dòng duy nhất có kích thước 1MB trả về E_LINE_TOO_LONG, không OOM, không loop vô tận."""
     with tempfile.TemporaryDirectory() as tmpdir:
         large_line_file = os.path.join(tmpdir, "oneline.txt")
-        # Tạo file 1 dòng duy nhất dài 1MB
+        # Tạo file 1 dòng duy nhất dài 1MB (không chứa dấu xuống dòng)
         with open(large_line_file, "w", encoding="utf-8") as f:
             f.write("A" * (1024 * 1024))
 
@@ -139,8 +139,26 @@ def test_read_file_single_large_line():
 
         assert elapsed < 2.0
         data = json.loads(res)
-        assert data["truncated"] is True
-        assert len(data["content"]) <= 256 * 1024
+        assert data["status"] == "ERROR"
+        assert data["code"] == "E_LINE_TOO_LONG"
+        assert "vượt quá trần an toàn" in data["message"]
+        assert len(data["partial_content"]) > 0
+
+def test_read_file_multi_large_lines_paging():
+    """Kiểm tra file nhiều dòng dài chạm byte cap: next_start_line trỏ đúng dòng kế tiếp, không bị None."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        large_file = os.path.join(tmpdir, "multilarge.txt")
+        # 3 dòng, mỗi dòng 100KB: dòng 1 và 2 cộng lại là 200KB, dòng 3 sẽ chạm trần 256KB
+        with open(large_file, "w", encoding="utf-8") as f:
+            f.write("A" * (100 * 1024) + "\n")
+            f.write("B" * (100 * 1024) + "\n")
+            f.write("C" * (100 * 1024) + "\n")
+
+        res = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "multilarge.txt", "start_line": 1}))
+        assert res["truncated"] is True
+        assert res["next_start_line"] == 3
+        assert res["eof"] is False
+        assert len(res["content"]) > 150 * 1024
 
 def test_read_file_vietnamese_paging():
     """Kiểm tra phân trang qua next_start_line trên file tiếng Việt không bị lỗi font mojibake."""
@@ -242,3 +260,16 @@ def test_run_shell_env_scrubbing():
         finally:
             os.environ.pop("TEST_SECRET_KEY", None)
             os.environ.pop("DATABASE_AUTH_PASSWORD", None)
+
+def test_run_capped_non_killing_test_runner():
+    """Kiểm tra _run_capped với kill_on_cap=False (dành cho TDD test runner) cho phép tiến trình chạy hết và trả exit code 0."""
+    from server import _run_capped
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Lệnh in 200KB output (> 128KB cap) rồi exit 0
+        cmd = 'python3 -c "import sys; sys.stdout.write(\'X\' * 200000); sys.exit(0)"'
+        out, rc, flag = _run_capped(cmd, tmpdir, os.environ.copy(), timeout=10, cap=128 * 1024, kill_on_cap=False)
+        assert rc == 0
+        assert flag == "capped"
+        assert "OUTPUT TRUNCATED" in out
+        assert len(out) >= 128 * 1024
+

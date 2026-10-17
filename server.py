@@ -294,9 +294,8 @@ def save_session(session_id: str, data: Dict[str, Any]) -> None:
                 pass
 
 def delete_session(session_id: str) -> bool:
-    """Xóa file session chỉ định trên đĩa."""
+    """Xóa file session chỉ định trên đĩa (giữ lại file .lock để chống race condition lock aliasing)."""
     file_path = get_session_file(session_id)
-    lock_file = file_path + ".lock"
     deleted = False
     if os.path.exists(file_path):
         try:
@@ -304,20 +303,15 @@ def delete_session(session_id: str) -> bool:
             deleted = True
         except Exception:
             pass
-    if os.path.exists(lock_file):
-        try:
-            os.remove(lock_file)
-        except Exception:
-            pass
     return deleted
 
 def delete_all_sessions() -> int:
-    """Xóa sạch toàn bộ session trên đĩa."""
+    """Xóa sạch toàn bộ file session .json trên đĩa (không xóa file .lock)."""
     if not os.path.exists(SESSIONS_DIR):
         return 0
     count = 0
     for fname in os.listdir(SESSIONS_DIR):
-        if fname.endswith(".json") or fname.endswith(".lock") or fname.startswith("tmp"):
+        if fname.endswith(".json") or fname.startswith("tmp"):
             try:
                 os.remove(os.path.join(SESSIONS_DIR, fname))
                 if fname.endswith(".json"):
@@ -459,9 +453,10 @@ def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
         } for i, tc in enumerate(tool_calls)]
     return d
 
-def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX_SHELL_OUT) -> Tuple[str, int, str]:
+def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX_SHELL_OUT, kill_on_cap: bool = True) -> Tuple[str, int, str]:
     """
-    Thực thi shell command với process group riêng biệt, streaming output có trần và kill tức thời khi chạm trần.
+    Thực thi shell command với process group riêng biệt, streaming output có trần và kill tức thời khi chạm trần (nếu kill_on_cap=True).
+    Đối với test runner (kill_on_cap=False), buffer chỉ nhận tối đa cap bytes nhưng tiến trình vẫn được phép chạy hoàn tất để lấy exit code thật.
     Trả về (output_text, exit_code, status_flag) với status_flag in ("ok", "capped", "timeout", "error").
     """
     try:
@@ -484,13 +479,19 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     def drain():
         try:
             fd = proc.stdout.fileno()
-            while len(buf) < cap:
-                chunk = os.read(fd, min(64 * 1024, cap - len(buf)))
-                if not chunk:
-                    break
-                buf.extend(chunk)
-            if len(buf) >= cap:
-                state["capped"] = True
+            while True:
+                if len(buf) < cap:
+                    chunk = os.read(fd, min(64 * 1024, cap - len(buf)))
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    if len(buf) >= cap:
+                        state["capped"] = True
+                else:
+                    # Nếu đã chạm cap nhưng không kill_on_cap, tiếp tục đọc xả để tránh nghẽn OS pipe buffer
+                    chunk = os.read(fd, 64 * 1024)
+                    if not chunk:
+                        break
         except (OSError, ValueError):
             return
 
@@ -501,7 +502,7 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     flag = "ok"
 
     while proc.poll() is None:
-        if state["capped"]:
+        if kill_on_cap and state["capped"]:
             flag = "capped"
             break
         if time.monotonic() > deadline:
@@ -512,8 +513,8 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     if state["capped"]:
         flag = "capped"
 
-    # Chạm cap hoặc timeout -> Kill cả process group ngay lập tức (không chờ hết 90s)
-    if proc.poll() is None:
+    # Chỉ kill khi timeout hoặc khi chạm cap với kill_on_cap=True
+    if proc.poll() is None and (flag == "timeout" or (flag == "capped" and kill_on_cap)):
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
@@ -627,6 +628,23 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
                         out.append(tail.decode("utf-8", errors="replace"))
     except Exception as e:
         return json.dumps({"status": "ERROR", "code": "E_READ_FAILED", "message": str(e)}, ensure_ascii=False)
+
+    # Nếu chạm trần byte MAX_READ_BYTES mà không đọc được dòng hoàn chỉnh nào (ví dụ dòng đầu tiên > 256KB)
+    if truncated and not out and tail:
+        sample = tail[:2000].decode("utf-8", errors="replace")
+        return json.dumps({
+            "status": "ERROR",
+            "code": "E_LINE_TOO_LONG",
+            "message": f"Dòng thứ {start} của '{rel_path}' dài vượt quá trần an toàn ({MAX_READ_BYTES} bytes, minified code hoặc JSON đơn dòng). Hãy dùng run_shell với lệnh 'head -c {MAX_READ_BYTES} ...' để bóc tách.",
+            "path": rel_path,
+            "start_line": start,
+            "file_size": st.st_size,
+            "partial_content": sample
+        }, ensure_ascii=False)
+
+    # Nếu bị truncated do chạm byte cap nhưng next_start chưa được gán
+    if truncated and next_start is None and out:
+        next_start = start + len(out)
 
     eof = (next_start is None and not truncated)
     end_line = start + len(out) - 1 if out else start - 1
@@ -1162,13 +1180,13 @@ def deepseek_code_task(
             reasoning_effort="none"
         )
         msg = res.choices[0].message
-        messages.append(msg)
+        messages.append(serialize_assistant_message(msg))
         loop_telemetry.append(extract_telemetry(res.usage))
 
         if not msg.tool_calls:
             # Model declares completion or gives text
             if test_cmd:
-                test_out, test_rc, test_flag = _run_capped(test_cmd, workspace, exec_env, timeout=90)
+                test_out, test_rc, test_flag = _run_capped(test_cmd, workspace, exec_env, timeout=90, kill_on_cap=False)
                 last_test_output = test_out
                 if test_rc == 0:
                     test_passed = True
@@ -1223,7 +1241,7 @@ def deepseek_code_task(
     adversarial_report = None
     if run_adversarial_review and git_diff:
         adversarial_report = deepseek_adversarial_review(
-            code_or_diff=git_diff,
+            code_or_diff=git_diff[:200_000],
             context_spec=spec_plan,
             effort="max"
         )
