@@ -13,10 +13,13 @@ import time
 import stat
 import fcntl
 import signal
+import select
 import threading
 import functools
 import subprocess
 import hashlib
+import zlib
+import copy
 import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
@@ -30,15 +33,17 @@ from openai import OpenAI
 DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-MAX_READ_BYTES = 24 * 1024        # 24KB content per page, fits within MAX_TOOL_RESULT (32KB) envelope cleanly
+MAX_READ_BYTES = 24 * 1024        # 24KB raw content per page
 MAX_READ_LINES = 2000             # 2000 lines max per read
 CHUNK_SIZE = 64 * 1024            # 64KB chunk streaming
-MAX_TOOL_RESULT = 32_000          # 32,000 chars per-tool-call cap in messages
+MAX_ENVELOPE_CONTENT_CHARS = 28_000 # Trần ký tự an toàn trước khi serialize JSON envelope
+MAX_TOOL_RESULT = 64_000          # 64,000 chars per-tool-call cap in messages
 MAX_SESSION_BYTES = 8 * 1024 * 1024 # 8MB max session JSON on disk
 MAX_SHELL_OUT = 128 * 1024        # 128KB output cap for shell commands
 
-# Khóa chặt bất biến: MAX_READ_BYTES + envelope dự trù luôn phải nhỏ hơn trần MAX_TOOL_RESULT
-assert MAX_READ_BYTES <= MAX_TOOL_RESULT - 4096, "MAX_READ_BYTES must leave room for JSON envelope in MAX_TOOL_RESULT"
+# Khóa chặt bất biến runtime an toàn
+if MAX_READ_BYTES > MAX_TOOL_RESULT - 4096:
+    raise ValueError("MAX_READ_BYTES must leave room for JSON envelope in MAX_TOOL_RESULT")
 
 DANGEROUS_COMMAND_PATTERNS = [
     r"\brm\s+.*(-[a-zA-Z0-9]*[rfRF]|--recursive|--force).*\s+(/|~|\$HOME|\*|/\*)(\s|$)",
@@ -200,9 +205,16 @@ def extract_telemetry(response_usage: Any) -> Dict[str, Any]:
 SESSIONS_DIR = os.path.expanduser("~/.local/share/deepseek-mcp/sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 SESSION_TTL_SECONDS = 86400  # 24 hours (1 ngày)
+_HOT_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 def get_session_file(session_id: str) -> str:
-    """Tạo đường dẫn an toàn cho session file, chặn path traversal và chống va chạm namespace."""
+    """Tạo đường dẫn an toàn cho session WAL file (.wal.jsonl), chặn path traversal và chống va chạm namespace."""
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)[:32]
+    id_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(SESSIONS_DIR, f"{safe_prefix}_{id_hash}.wal.jsonl")
+
+def get_legacy_session_file(session_id: str) -> str:
+    """Tạo đường dẫn legacy file session .json phục vụ tương thích ngược."""
     safe_prefix = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)[:32]
     id_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
     return os.path.join(SESSIONS_DIR, f"{safe_prefix}_{id_hash}.json")
@@ -261,18 +273,69 @@ def _normalize_session(session_id: str, data: Optional[Dict[str, Any]], system_p
     }
 
 def load_session(session_id: str) -> Optional[Dict[str, Any]]:
-    """Tải session từ đĩa, tự hủy nếu quá hạn TTL."""
-    file_path = get_session_file(session_id)
-    if os.path.exists(file_path):
+    """Tải session từ Hot Plane (RAM) hoặc phục hồi từ Cold Plane (WAL với CRC32) trên đĩa."""
+    now = time.time()
+
+    # 1. Hot Plane (RAM)
+    if session_id in _HOT_SESSIONS:
+        cached = _HOT_SESSIONS[session_id]
+        if now - cached.get("updated_at", 0) > SESSION_TTL_SECONDS:
+            delete_session(session_id)
+            return None
+        return copy.deepcopy(cached)
+
+    # 2. Cold Plane (WAL: .wal.jsonl)
+    wal_path = get_session_file(session_id)
+    if os.path.exists(wal_path):
+        last_valid_data = None
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if time.time() - data.get("updated_at", 0) > SESSION_TTL_SECONDS:
-                os.remove(file_path)
+            with open(wal_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        crc = record.get("crc")
+                        payload_str = record.get("payload")
+                        if payload_str is not None and crc is not None:
+                            calc_crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
+                            if calc_crc == crc:
+                                last_valid_data = json.loads(payload_str)
+                            else:
+                                sys.stderr.write(f"Warning: Corrupt WAL frame in session {session_id} (CRC mismatch)\n")
+                    except Exception as parse_err:
+                        sys.stderr.write(f"Warning: Invalid WAL line in session {session_id}: {parse_err}\n")
+                        continue
+
+            if last_valid_data is not None:
+                if now - last_valid_data.get("updated_at", 0) > SESSION_TTL_SECONDS:
+                    delete_session(session_id)
+                    return None
+                _HOT_SESSIONS[session_id] = copy.deepcopy(last_valid_data)
+                return last_valid_data
+        except Exception as e:
+            sys.stderr.write(f"Error reading WAL for session {session_id}: {e}\n")
+
+    # 3. Fallback: Legacy file .json
+    legacy_path = get_legacy_session_file(session_id)
+    if os.path.exists(legacy_path):
+        try:
+            with open(legacy_path, "r", encoding="utf-8") as f:
+                legacy_data = json.load(f)
+            if now - legacy_data.get("updated_at", 0) > SESSION_TTL_SECONDS:
+                delete_session(session_id)
                 return None
-            return data
+            _HOT_SESSIONS[session_id] = copy.deepcopy(legacy_data)
+            save_session(session_id, legacy_data)
+            try:
+                os.remove(legacy_path)
+            except Exception:
+                pass
+            return legacy_data
         except Exception:
             return None
+
     return None
 
 def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX_SESSION_BYTES) -> List[Dict[str, Any]]:
@@ -349,74 +412,141 @@ def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX
     return pruned
 
 def save_session(session_id: str, data: Dict[str, Any]) -> bool:
-    """Ghi bền vững và nguyên tử (atomic write) session xuống file JSON trên đĩa, enforce trần MAX_SESSION_BYTES."""
-    file_path = get_session_file(session_id)
-    dir_name = os.path.dirname(file_path)
-    os.makedirs(dir_name, exist_ok=True)
-    temp_path = None
+    """Ghi session: cập nhật Hot Plane RAM và ghi nối tiếp (append-only WAL) kèm CRC-32."""
     try:
         # Nếu session có messages, tỉa theo ranh giới turn boundary hợp lệ trước khi serialize
         if "messages" in data and isinstance(data["messages"], list):
             data["messages"] = _prune_session_messages(data["messages"], MAX_SESSION_BYTES)
 
-        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        # Cập nhật Hot Plane (RAM)
+        _HOT_SESSIONS[session_id] = copy.deepcopy(data)
 
-        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-            temp_path = tf.name   # Gán NGAY trước khi ghi, chống leak file nếu fail
-            tf.write(payload)
-            tf.flush()
-            os.fsync(tf.fileno())
-        os.replace(temp_path, file_path)
-        temp_path = None
+        # Serialize compact payload và tính CRC-32
+        payload_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+        crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
+        wal_record = json.dumps({
+            "crc": crc,
+            "ts": time.time(),
+            "payload": payload_str
+        }, ensure_ascii=False) + "\n"
+
+        wal_path = get_session_file(session_id)
+        dir_name = os.path.dirname(wal_path)
+        os.makedirs(dir_name, exist_ok=True)
+
+        # Compaction check: nếu file đã vượt quá 30 frames hoặc > 512KB, nén về snapshot duy nhất
+        should_compact = False
+        if os.path.exists(wal_path):
+            try:
+                st = os.stat(wal_path)
+                if st.st_size > 512 * 1024:
+                    should_compact = True
+                else:
+                    with open(wal_path, "r", encoding="utf-8") as f:
+                        line_count = sum(1 for _ in f)
+                    if line_count >= 30:
+                        should_compact = True
+            except Exception:
+                pass
+
+        if should_compact:
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                    temp_path = tf.name
+                    tf.write(wal_record)
+                    tf.flush()
+                    os.fsync(tf.fileno())
+                os.replace(temp_path, wal_path)
+                temp_path = None
+                dfd = os.open(dir_name, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            finally:
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+        else:
+            is_new = not os.path.exists(wal_path)
+            with open(wal_path, "a", encoding="utf-8") as f:
+                f.write(wal_record)
+                f.flush()
+                os.fsync(f.fileno())
+            if is_new:
+                dfd = os.open(dir_name, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+
         return True
     except Exception as e:
         sys.stderr.write(f"Error saving session {session_id}: {str(e)}\n")
         return False
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
 
 def delete_session(session_id: str) -> bool:
-    """Xóa file session chỉ định trên đĩa (giữ lại file .lock để chống race condition lock aliasing)."""
-    file_path = get_session_file(session_id)
+    """Xóa session khỏi RAM và xóa file WAL (.wal.jsonl) cùng file legacy trên đĩa."""
+    _HOT_SESSIONS.pop(session_id, None)
+    wal_path = get_session_file(session_id)
+    legacy_path = get_legacy_session_file(session_id)
     deleted = False
-    if os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            deleted = True
-        except Exception:
-            pass
+    for p in (wal_path, legacy_path):
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                deleted = True
+            except Exception:
+                pass
     return deleted
 
 def delete_all_sessions() -> int:
-    """Xóa sạch toàn bộ file session .json trên đĩa (không xóa file .lock)."""
+    """Xóa sạch toàn bộ session trong RAM và file WAL/legacy trên đĩa (không xóa file .lock)."""
+    _HOT_SESSIONS.clear()
     if not os.path.exists(SESSIONS_DIR):
         return 0
     count = 0
+    now = time.time()
     for fname in os.listdir(SESSIONS_DIR):
-        if fname.endswith(".json") or fname.startswith("tmp"):
+        fpath = os.path.join(SESSIONS_DIR, fname)
+        if fname.endswith((".wal.jsonl", ".json")):
             try:
-                os.remove(os.path.join(SESSIONS_DIR, fname))
-                if fname.endswith(".json"):
-                    count += 1
+                os.remove(fpath)
+                count += 1
+            except Exception:
+                pass
+        elif fname.startswith("tmp"):
+            try:
+                if now - os.path.getmtime(fpath) > 60:
+                    os.remove(fpath)
             except Exception:
                 pass
     return count
 
 def cleanup_expired_sessions() -> None:
-    """Tự động dọn dẹp các session quá hạn TTL (24h) trên đĩa."""
+    """Tự động dọn dẹp các session quá hạn TTL (24h) trong RAM và trên đĩa."""
+    now = time.time()
+    expired_keys = [sid for sid, d in _HOT_SESSIONS.items() if now - d.get("updated_at", 0) > SESSION_TTL_SECONDS]
+    for sid in expired_keys:
+        _HOT_SESSIONS.pop(sid, None)
+
     if not os.path.exists(SESSIONS_DIR):
         return
-    now = time.time()
     try:
         for fname in os.listdir(SESSIONS_DIR):
-            if fname.endswith(".json") or fname.startswith("tmp"):
-                fpath = os.path.join(SESSIONS_DIR, fname)
+            fpath = os.path.join(SESSIONS_DIR, fname)
+            if fname.endswith((".wal.jsonl", ".json")):
                 try:
                     if now - os.path.getmtime(fpath) > SESSION_TTL_SECONDS:
+                        os.remove(fpath)
+                except Exception:
+                    pass
+            elif fname.startswith("tmp"):
+                try:
+                    if now - os.path.getmtime(fpath) > 3600:
                         os.remove(fpath)
                 except Exception:
                     pass
@@ -563,71 +693,81 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     except Exception as e:
         return f"Process spawn error: {str(e)}", -1, "error"
 
-    buf = bytearray()
-    state = {"capped": False}
-
-    def drain():
-        try:
-            fd = proc.stdout.fileno()
-            while True:
-                if len(buf) < cap:
-                    chunk = os.read(fd, min(64 * 1024, cap - len(buf)))
-                    if not chunk:
-                        break
-                    buf.extend(chunk)
-                    if len(buf) >= cap:
-                        state["capped"] = True
-                else:
-                    # Nếu đã chạm cap nhưng không kill_on_cap, tiếp tục đọc xả để tránh nghẽn OS pipe buffer
-                    chunk = os.read(fd, 64 * 1024)
-                    if not chunk:
-                        break
-        except (OSError, ValueError):
-            return
-
-    t = threading.Thread(target=drain, daemon=True)
-    t.start()
-
-    deadline = time.monotonic() + timeout
-    flag = "ok"
-
-    while proc.poll() is None:
-        if kill_on_cap and state["capped"]:
-            flag = "capped"
-            break
-        if time.monotonic() > deadline:
-            flag = "timeout"
-            break
-        time.sleep(0.05)
-
-    # C1: Ưu tiên timeout > capped để chống nuốt timeout khi kill_on_cap=False (chỉ khi process chưa thoát)
-    if time.monotonic() > deadline and proc.poll() is None:
-        flag = "timeout"
-    elif state["capped"]:
-        flag = "capped"
-
-    # Chỉ kill khi timeout hoặc khi chạm cap với kill_on_cap=True
-    if proc.poll() is None and (flag == "timeout" or (flag == "capped" and kill_on_cap)):
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
+    rfd = proc.stdout.fileno()
     try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    # C2: Đảm bảo dọn sạch các tiến trình con cháu (orphaned grandchildren) tránh rò rỉ pipe
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+        os.set_blocking(rfd, False)
+    except Exception:
         pass
 
-    t.join(timeout=2)
+    buf = bytearray()
+    capped = False
+    flag = "ok"
+    deadline = time.monotonic() + timeout
+    drain_deadline = None
+
+    while True:
+        now = time.monotonic()
+        if drain_deadline is not None and now > drain_deadline:
+            break
+
+        poll_res = proc.poll()
+        if poll_res is not None and drain_deadline is None:
+            # Cho thời hạn ân hạn 250ms để đọc nốt buffer còn sót của grandchildren
+            drain_deadline = now + 0.25
+
+        # Đọc non-blocking từ stdout pipe
+        try:
+            r_ready, _, _ = select.select([rfd], [], [], 0.02)
+            if r_ready:
+                chunk = os.read(rfd, 64 * 1024)
+                if not chunk:
+                    # Pipe EOF thật sự
+                    break
+                if len(buf) < cap:
+                    buf.extend(chunk[:cap - len(buf)])
+                if len(buf) >= cap:
+                    capped = True
+                    if kill_on_cap:
+                        flag = "capped"
+                        try:
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError):
+                            pass
+                        drain_deadline = time.monotonic() + 0.10
+        except (BlockingIOError, InterruptedError):
+            pass
+        except (OSError, ValueError):
+            break
+
+        # Kiểm tra timeout
+        if poll_res is None and now > deadline:
+            flag = "timeout"
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            drain_deadline = time.monotonic() + 0.10
+
+        if poll_res is not None and drain_deadline is not None and time.monotonic() > drain_deadline:
+            break
+
+    if flag == "ok":
+        if capped:
+            flag = "capped"
+        elif proc.poll() is None and time.monotonic() > deadline:
+            flag = "timeout"
+
+    # Dọn dẹp tiến trình con và nhóm tiến trình
+    if proc.poll() is None:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
     try:
         proc.stdout.close()
     except Exception:
@@ -666,16 +806,16 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
     want = MAX_READ_LINES if line_count is None else max(1, min(_as_int(line_count, MAX_READ_LINES), MAX_READ_LINES))
     use_line_numbers = True if line_numbers is None else bool(line_numbers)
 
-    if st.st_size == 0 or start > st.st_size:
+    if st.st_size == 0:
         return json.dumps({
             "path": rel_path,
             "start_line": start,
-            "end_line": start - 1,
+            "end_line": 0,
             "next_start_line": None,
             "truncated": False,
             "eof": True,
             "line_numbers": use_line_numbers,
-            "file_size": st.st_size,
+            "file_size": 0,
             "bytes_returned": 0,
             "next_step": None,
             "content": ""
@@ -685,6 +825,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
     tail = b""
     line_no = 0
     emitted_bytes = 0
+    emitted_chars = 0
     next_start = None
     truncated = False
 
@@ -709,13 +850,16 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
                     line_no += 1
                     if line_no < start:
                         continue
-                    if len(out) >= want or (out and emitted_bytes + len(raw) > MAX_READ_BYTES):
+                    line_text = raw.decode("utf-8", errors="replace") + "\n"
+                    line_chars = len(line_text) + (len(str(line_no)) + 2 if use_line_numbers else 0)
+                    if len(out) >= want or (out and (emitted_bytes + len(raw) > MAX_READ_BYTES or emitted_chars + line_chars > MAX_ENVELOPE_CONTENT_CHARS)):
                         next_start = line_no
                         truncated = True
                         stop = True
                         break
-                    out.append(raw.decode("utf-8", errors="replace") + "\n")
+                    out.append(line_text)
                     emitted_bytes += len(raw) + 1
+                    emitted_chars += line_chars
                 if stop:
                     break
 
@@ -731,12 +875,15 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
             if not truncated and tail:
                 line_no += 1
                 if line_no >= start:
-                    if len(out) >= want or (out and emitted_bytes + len(tail) > MAX_READ_BYTES):
+                    tail_text = tail.decode("utf-8", errors="replace")
+                    tail_chars = len(tail_text) + (len(str(line_no)) + 2 if use_line_numbers else 0)
+                    if len(out) >= want or (out and (emitted_bytes + len(tail) > MAX_READ_BYTES or emitted_chars + tail_chars > MAX_ENVELOPE_CONTENT_CHARS)):
                         next_start = line_no
                         truncated = True
                     else:
-                        out.append(tail.decode("utf-8", errors="replace"))
+                        out.append(tail_text)
                         emitted_bytes += len(tail)
+                        emitted_chars += tail_chars
     except Exception as e:
         return json.dumps({"status": "ERROR", "code": "E_READ_FAILED", "message": str(e)}, ensure_ascii=False)
 
@@ -762,7 +909,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
         next_start = start + len(out)
 
     eof = (next_start is None and not truncated)
-    end_line = start + len(out) - 1 if out else start - 1
+    end_line = start + len(out) - 1 if out else max(0, line_no)
     if use_line_numbers:
         body = "".join(f"{start + idx}: {line_str}" for idx, line_str in enumerate(out))
     else:
@@ -822,6 +969,14 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                     pass
             os.replace(temp_p, full_path)
             temp_p = None
+            try:
+                dfd = os.open(dir_name, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
             return f"Successfully wrote {len(content)} characters to '{rel_path}'."
         except Exception as e:
             return f"Error writing file: {str(e)}"
@@ -855,30 +1010,48 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                 return f"Error: File '{rel_path}' không phải định dạng UTF-8 hợp lệ, từ chối chỉnh sửa để chống hỏng dữ liệu."
 
             if search_block not in current_text:
-                # Fallback: Tự động bóc tách tiền tố số dòng nếu model copy từ read_file (ví dụ "42: code")
-                stripped_lines = []
-                has_line_no = False
-                for line in search_block.splitlines(keepends=True):
+                # Fallback: Chỉ bóc tách tiền tố số dòng khi 100% dòng bắt đầu ở Column 0 và tăng dần liên tục (Contiguity Gate)
+                s_lines = search_block.splitlines(keepends=True)
+                s_nums = []
+                s_rests = []
+                is_pure_numbered = True
+
+                for line in s_lines:
                     le = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
                     content_part = line[:-len(le)] if le else line
-                    m = re.match(r"^[ \t]*\d+[:|][ \t]?(.*)$", content_part)
+                    m = re.match(r"^(?P<n>[1-9][0-9]{0,8}): (?P<rest>.*)$", content_part)
                     if m:
-                        has_line_no = True
-                        stripped_lines.append(m.group(1) + le)
+                        s_nums.append(int(m.group("n")))
+                        s_rests.append(m.group("rest") + le)
                     else:
-                        stripped_lines.append(line)
-                if has_line_no:
-                    candidate = "".join(stripped_lines)
-                    if candidate in current_text:
-                        search_block = candidate
-                        # Bóc tách tương tự cho replace_block nếu replace_block cũng chứa số dòng
-                        r_stripped = []
-                        for r_line in replace_block.splitlines(keepends=True):
-                            r_le = "\r\n" if r_line.endswith("\r\n") else ("\n" if r_line.endswith("\n") else "")
-                            r_content = r_line[:-len(r_le)] if r_le else r_line
-                            rm = re.match(r"^[ \t]*\d+[:|][ \t]?(.*)$", r_content)
-                            r_stripped.append((rm.group(1) + r_le) if rm else r_line)
-                        replace_block = "".join(r_stripped)
+                        is_pure_numbered = False
+                        break
+
+                if is_pure_numbered and s_nums:
+                    expected_run = list(range(s_nums[0], s_nums[0] + len(s_nums)))
+                    if s_nums == expected_run:
+                        candidate = "".join(s_rests)
+                        if candidate in current_text:
+                            search_block = candidate
+                            # Kiểm tra an toàn cho replace_block: CHỈ strip nếu 100% dòng cũng khớp numbering hợp lệ
+                            r_lines = replace_block.splitlines(keepends=True)
+                            r_nums = []
+                            r_rests = []
+                            r_pure_numbered = True
+                            for r_line in r_lines:
+                                r_le = "\r\n" if r_line.endswith("\r\n") else ("\n" if r_line.endswith("\n") else "")
+                                r_content = r_line[:-len(r_le)] if r_le else r_line
+                                rm = re.match(r"^(?P<n>[1-9][0-9]{0,8}): (?P<rest>.*)$", r_content)
+                                if rm:
+                                    r_nums.append(int(rm.group("n")))
+                                    r_rests.append(rm.group("rest") + r_le)
+                                else:
+                                    r_pure_numbered = False
+                                    break
+                            if r_pure_numbered and r_nums:
+                                r_expected = list(range(r_nums[0], r_nums[0] + len(r_nums)))
+                                if r_nums == r_expected:
+                                    replace_block = "".join(r_rests)
 
             if search_block not in current_text:
                 return f"Error: search_block không tìm thấy trong file '{rel_path}'."
@@ -899,6 +1072,14 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                     pass
             os.replace(temp_p, full_path)
             temp_p = None
+            try:
+                dfd = os.open(dir_name, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
             return f"Successfully replaced search block in '{rel_path}'."
         except Exception as e:
             return f"Error editing file: {str(e)}"

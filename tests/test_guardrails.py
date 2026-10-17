@@ -517,4 +517,214 @@ def test_session_pruning_turn_boundary():
     assert pruned[2]["tool_calls"][0]["id"] == "call_2"
 
 
+def test_edit_file_replace_does_not_strip_dict_literal_or_non_contiguous(tmp_path):
+    """
+    Test P0: Đảm bảo regex Column 0 và Contiguity Gate trong edit_file_replace:
+    1. Tuyệt đối không strip các key số trong dict literal thụt lề ({200: "OK"}).
+    2. Không strip các dòng ở Column 0 nếu số dòng nhảy cóc không liên tục (bước != 1).
+    3. Tự động strip đúng và an toàn khi người dùng paste toàn bộ kết quả có số dòng liên tục từ read_file.
+    """
+    from server import execute_local_tool
+    
+    # 1. Dict literal có thụt lề
+    target_file = tmp_path / "dict_test.py"
+    initial_content = (
+        "STATUS_CODES = {\n"
+        "    200: 'OK',\n"
+        "    404: 'Not Found',\n"
+        "    500: 'Internal Server Error',\n"
+        "}\n"
+    )
+    target_file.write_text(initial_content, encoding="utf-8")
+    
+    # Search block chứa dict key, thụt 4 space
+    search_block = "    200: 'OK',\n    404: 'Not Found',"
+    replace_block = "    200: 'Success',\n    404: 'Missing',"
+    res = execute_local_tool(str(tmp_path), "edit_file_replace", {
+        "path": "dict_test.py",
+        "search_block": search_block,
+        "replace_block": replace_block
+    })
+    assert "Successfully replaced" in res
+    updated = target_file.read_text(encoding="utf-8")
+    assert "200: 'Success'" in updated
+    assert "404: 'Missing'" in updated
+    assert "    'Success'" not in updated  # Đảm bảo key 200 không bị nuốt!
+
+    # 2. Số ở Column 0 nhưng nhảy cóc (non-contiguous)
+    non_contig_file = tmp_path / "non_contig.txt"
+    non_contig_file.write_text("10: first\n20: second\n30: third\n", encoding="utf-8")
+    s_block = "10: first\n20: second\n"
+    r_block = "10: Alpha\n20: Beta\n"
+    res2 = execute_local_tool(str(tmp_path), "edit_file_replace", {
+        "path": "non_contig.txt",
+        "search_block": s_block,
+        "replace_block": r_block
+    })
+    assert "Successfully replaced" in res2
+    assert non_contig_file.read_text(encoding="utf-8") == "10: Alpha\n20: Beta\n30: third\n"
+
+    # 3. Kết quả paste từ read_file với số dòng tăng dần liên tục bước 1
+    code_file = tmp_path / "code.py"
+    code_file.write_text("def hello():\n    print('world')\n    return 42\n", encoding="utf-8")
+    
+    # Đọc qua read_file (có line numbers ở Column 0)
+    read_res = json.loads(execute_local_tool(str(tmp_path), "read_file", {
+        "path": "code.py",
+        "start_line": 1,
+        "line_count": 10,
+        "line_numbers": True
+    }))
+    assert "1: def hello():" in read_res["content"]
+    
+    # User copy paste nguyên cụm có line numbers vào search block
+    s_with_lines = "1: def hello():\n2:     print('world')\n"
+    r_clean = "def hello_v2():\n    print('new world')\n"
+    res3 = execute_local_tool(str(tmp_path), "edit_file_replace", {
+        "path": "code.py",
+        "search_block": s_with_lines,
+        "replace_block": r_clean
+    })
+    assert "Successfully replaced" in res3
+    assert "hello_v2" in code_file.read_text(encoding="utf-8")
+
+
+def test_run_capped_nonblocking_grandchild_pipe():
+    """
+    Test P1: Single-threaded Non-blocking Selector trong _run_capped.
+    Đảm bảo không bị treo khi tiến trình cháu (grandchild background process) giữ stdout pipe mở.
+    """
+    from server import _run_capped
+    
+    # Lệnh spawn background process giữ stdout mở trong 3s, tiến trình cha thoát ngay
+    cmd = "python3 -c \"import subprocess, sys; subprocess.Popen(['sleep', '3']); print('parent_done')\""
+    t0 = time.time()
+    out, rc, flag = _run_capped(cmd, cwd=None, env=None, timeout=5)
+    elapsed = time.time() - t0
+    
+    assert rc == 0
+    assert flag == "ok"
+    assert "parent_done" in out
+    # Selector non-blocking phải thoát trong thời hạn grace deadline (< 1.5s), tuyệt đối không đợi 3s sleep
+    assert elapsed < 2.0
+
+
+def test_session_wal_dual_plane_and_crc_recovery():
+    """
+    Test P1: Dual-Plane JSONL WAL Session Storage.
+    1. Kiểm tra append-only và CRC-32 integrity.
+    2. Hot Plane phục vụ trực tiếp từ RAM.
+    3. Tự động phục hồi snapshot hợp lệ gần nhất khi phát hiện frame bị hỏng/corrupt.
+    4. Tự động compaction khi vượt ngưỡng 30 turns.
+    """
+    from server import (
+        save_session,
+        load_session,
+        delete_session,
+        get_session_file,
+        _HOT_SESSIONS
+    )
+    
+    sid = "test-wal-recovery-session"
+    delete_session(sid)
+    wal_file = get_session_file(sid)
+    assert not os.path.exists(wal_file)
+    
+    # 1. Ghi 3 turns nối tiếp
+    for turn in range(1, 4):
+        data = {
+            "session_id": sid,
+            "messages": [{"role": "user", "content": f"query {turn}"}],
+            "turn_count": turn,
+            "updated_at": 2000000000.0,
+            "created_at": 2000000000.0
+        }
+        assert save_session(sid, data) is True
+    
+    assert os.path.exists(wal_file)
+    with open(wal_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    assert len(lines) == 3
+    
+    # 2. Hot Plane: load trực tiếp từ RAM
+    loaded_hot = load_session(sid)
+    assert loaded_hot is not None
+    assert loaded_hot["turn_count"] == 3
+    
+    # 3. CRC Recovery: Append 1 frame corrupt vào đuôi file WAL, xóa RAM cache
+    with open(wal_file, "a", encoding="utf-8") as f:
+        f.write('{"crc": 99999999, "ts": 2000000005.0, "payload": "{\\"turn_count\\": 99}"}\n')
+    
+    _HOT_SESSIONS.clear()  # Xóa Hot Plane để ép đọc lại từ đĩa
+    
+    loaded_recovered = load_session(sid)
+    assert loaded_recovered is not None
+    # Phải bỏ qua frame 99 bị lỗi CRC và khôi phục về snapshot turn 3
+    assert loaded_recovered["turn_count"] == 3
+    
+    # 4. Compaction: Ghi tiếp cho đến khi chạm ngưỡng 30 frames
+    # Trước vòng lặp: file có 3 turns + 1 corrupt = 4 dòng.
+    # Ghi tiếp từ turn 4 đến 29 -> file có 30 dòng.
+    for turn in range(4, 30):
+        data = {
+            "session_id": sid,
+            "messages": [{"role": "user", "content": f"query {turn}"}],
+            "turn_count": turn,
+            "updated_at": 2000000000.0,
+            "created_at": 2000000000.0
+        }
+        save_session(sid, data)
+        
+    with open(wal_file, "r", encoding="utf-8") as f:
+        pre_compact_lines = [l.strip() for l in f if l.strip()]
+    assert len(pre_compact_lines) == 30
+    
+    # Ghi turn 30: tại thời điểm ghi turn 30, file đang có 30 dòng >= 30 -> kích hoạt compaction!
+    turn_30_data = {
+        "session_id": sid,
+        "messages": [{"role": "user", "content": "query 30"}],
+        "turn_count": 30,
+        "updated_at": 2000000000.0,
+        "created_at": 2000000000.0
+    }
+    save_session(sid, turn_30_data)
+    
+    # Sau khi compact, file WAL phải được thu gọn lại thành đúng 1 snapshot duy nhất!
+    with open(wal_file, "r", encoding="utf-8") as f:
+        compact_lines = [l.strip() for l in f if l.strip()]
+    assert len(compact_lines) == 1
+    
+    _HOT_SESSIONS.clear()
+    loaded_compact = load_session(sid)
+    assert loaded_compact is not None
+    assert loaded_compact["turn_count"] == 30
+    
+    # Dọn dẹp
+    delete_session(sid)
+    assert not os.path.exists(wal_file)
+    assert sid not in _HOT_SESSIONS
+
+
+def test_read_file_envelope_empty_file(tmp_path):
+    """
+    Test P0: Kiểm tra _read_file_envelope với file rỗng (0 bytes).
+    Không bị lỗi so sánh start_line và file size.
+    """
+    from server import execute_local_tool
+    
+    empty_file = tmp_path / "empty.txt"
+    empty_file.write_text("", encoding="utf-8")
+    
+    res = json.loads(execute_local_tool(str(tmp_path), "read_file", {
+        "path": "empty.txt",
+        "start_line": 1,
+        "line_count": 100
+    }))
+    assert res["content"] == ""
+    assert res["end_line"] == 0
+    assert res["truncated"] is False
+    assert res["eof"] is True
+
+
+
 
