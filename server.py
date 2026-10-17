@@ -204,7 +204,7 @@ def extract_telemetry(response_usage: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 SESSIONS_DIR = os.path.expanduser("~/.local/share/deepseek-mcp/sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
-SESSION_TTL_SECONDS = 86400  # 24 hours (1 ngày)
+SESSION_TTL_SECONDS = 14400  # 4 hours (4 tiếng)
 _HOT_SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 def get_session_file(session_id: str) -> str:
@@ -625,7 +625,7 @@ def delete_all_sessions() -> int:
     return count
 
 def cleanup_expired_sessions() -> None:
-    """Tự động dọn dẹp các session quá hạn TTL (24h) trong RAM và trên đĩa."""
+    """Tự động dọn dẹp các session quá hạn TTL (4h) trong RAM và trên đĩa."""
     now = time.time()
     expired_keys = [sid for sid, d in _HOT_SESSIONS.items() if now - d.get("updated_at", 0) > SESSION_TTL_SECONDS]
     for sid in expired_keys:
