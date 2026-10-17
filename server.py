@@ -327,11 +327,11 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
                 delete_session(session_id)
                 return None
             _HOT_SESSIONS[session_id] = copy.deepcopy(legacy_data)
-            save_session(session_id, legacy_data)
-            try:
-                os.remove(legacy_path)
-            except Exception:
-                pass
+            if save_session(session_id, legacy_data):
+                try:
+                    os.remove(legacy_path)
+                except Exception:
+                    pass
             return legacy_data
         except Exception:
             return None
@@ -418,9 +418,6 @@ def save_session(session_id: str, data: Dict[str, Any]) -> bool:
         if "messages" in data and isinstance(data["messages"], list):
             data["messages"] = _prune_session_messages(data["messages"], MAX_SESSION_BYTES)
 
-        # Cập nhật Hot Plane (RAM)
-        _HOT_SESSIONS[session_id] = copy.deepcopy(data)
-
         # Serialize compact payload và tính CRC-32
         payload_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
         crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
@@ -483,6 +480,8 @@ def save_session(session_id: str, data: Dict[str, Any]) -> bool:
                 finally:
                     os.close(dfd)
 
+        # Cập nhật Hot Plane (RAM) sau khi ghi đĩa thành công
+        _HOT_SESSIONS[session_id] = copy.deepcopy(data)
         return True
     except Exception as e:
         sys.stderr.write(f"Error saving session {session_id}: {str(e)}\n")
@@ -1369,13 +1368,6 @@ def deepseek_session_clear(session_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
     sid = session_id.strip()
-    if sid.lower() in ("reload", "restart"):
-        def _exit_soon():
-            time.sleep(0.1)
-            os._exit(0)
-        threading.Thread(target=_exit_soon, daemon=True).start()
-        return json.dumps({"status": "SUCCESS", "message": "Tiến trình MCP server đang tự làm mới để nạp code mới..."}, ensure_ascii=False)
-
     if sid.lower() == "all":
         count = delete_all_sessions()
         return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
