@@ -216,7 +216,7 @@ READ_ONLY_TOOLS_SCHEMA = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sub_dir": {"type": "string", "description": "Thư mục con cần xem (để trống nếu xem từ root workspace)"}
+                    "path": {"type": "string", "description": "Đường dẫn thư mục cần xem trong workspace (để trống hoặc '.' để xem từ root workspace)"}
                 }
             }
         }
@@ -271,24 +271,102 @@ LOCAL_TOOLS_SCHEMA = READ_ONLY_TOOLS_SCHEMA + [
     }
 ]
 
+TOOL_SYSTEM_DIRECTIVE = (
+    "\n\n[CRITICAL TOOL PROTOCOL & EXECUTION RULES]\n"
+    "1. ZERO-PREAMBLE CONSTRAINT: When you need to inspect files, you MUST invoke the tool immediately. "
+    "NEVER output conversational filler, introductory remarks, or preamble text before a tool call.\n"
+    "2. STRICT SCHEMA ADHERENCE: Use ONLY the exact tool names ('read_file', 'list_files') and exact parameter keys ('path') "
+    "defined in the schema. Do not invent aliases or extra parameters.\n"
+    "3. NO RAW MARKUP: Rely strictly on native tool calls. Never emit raw DSML or XML tags into conversation text.\n"
+    "4. SYNTHESIS: Provide your comprehensive analysis or verdict only after all necessary tools have returned their results."
+)
+
+class ParsedToolCall:
+    def __init__(self, call_id: str, name: str, arguments: Dict[str, Any]):
+        self.id = call_id
+        self.type = "function"
+        self.function = type("Function", (), {
+            "name": name,
+            "arguments": json.dumps(arguments, ensure_ascii=False)
+        })()
+
+def parse_dsml_tool_calls(content: str) -> Tuple[List[Any], str]:
+    """
+    Bóc tách các tool calls định dạng DSML nếu model xả thẳng ra text trong content.
+    Hỗ trợ cả ký tự đơn ｜, kép ｜｜ và ascii |.
+    Trả về (list các tool_call objects tương thích OpenAI, cleaned_content).
+    """
+    if not content or "DSML" not in content:
+        return [], content
+
+    tool_calls = []
+    invoke_pattern = re.compile(
+        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\s+name=[\"']([^\"']+)[\"']>(.*?)</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke>",
+        re.DOTALL
+    )
+    param_pattern = re.compile(
+        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter\s+name=[\"']([^\"']+)[\"'](?:\s+string=[\"'](true|false)[\"'])?>(.*?)</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter>",
+        re.DOTALL
+    )
+
+    clean_content = content
+    for idx, match in enumerate(invoke_pattern.finditer(content)):
+        fn_name = match.group(1).strip()
+        body = match.group(2)
+        args = {}
+        for p_match in param_pattern.finditer(body):
+            p_name = p_match.group(1).strip()
+            is_str = p_match.group(2) != "false"
+            val = p_match.group(3).strip()
+            if not is_str:
+                try:
+                    val = json.loads(val)
+                except Exception:
+                    pass
+            args[p_name] = val
+        
+        # Hỗ trợ alias phổ biến
+        if fn_name == "list_directory":
+            fn_name = "list_files"
+            
+        call_id = f"call_dsml_{int(time.time())}_{idx}"
+        tool_calls.append(ParsedToolCall(call_id, fn_name, args))
+
+    # Xóa sạch toàn bộ block DSML khỏi content để không làm rác ngữ cảnh
+    clean_content = re.sub(
+        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:calls|tool_calls)>.*?</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:calls|tool_calls)>",
+        "",
+        clean_content,
+        flags=re.DOTALL
+    )
+    clean_content = re.sub(
+        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke.*?</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke>",
+        "",
+        clean_content,
+        flags=re.DOTALL
+    ).strip()
+
+    return tool_calls, clean_content
+
 def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
     """Chuyển đổi assistant message thành dictionary tương thích JSON và DeepSeek API."""
     d: Dict[str, Any] = {
         "role": "assistant",
-        "content": msg.content or ""
+        "content": getattr(msg, "content", "") or ""
     }
     reasoning = getattr(msg, "reasoning_content", None)
     if reasoning:
         d["reasoning_content"] = reasoning
-    if getattr(msg, "tool_calls", None):
+    tool_calls = getattr(msg, "tool_calls", None)
+    if tool_calls:
         d["tool_calls"] = [{
-            "id": tc.id,
+            "id": getattr(tc, "id", f"call_{i}"),
             "type": "function",
             "function": {
                 "name": tc.function.name,
                 "arguments": tc.function.arguments
             }
-        } for tc in msg.tool_calls]
+        } for i, tc in enumerate(tool_calls)]
     return d
 
 def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
@@ -369,9 +447,11 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         except Exception as e:
             return f"Command execution error: {str(e)}"
             
-    elif name == "list_files":
-        sub_dir = args.get("sub_dir", "")
-        safe, full_path = is_safe_path(workspace, sub_dir)
+    elif name in ["list_files", "list_directory"]:
+        rel_path = args.get("path") or args.get("sub_dir") or ""
+        if rel_path == ".":
+            rel_path = ""
+        safe, full_path = is_safe_path(workspace, rel_path)
         if not safe:
             return "Error: Path ngoài workspace."
         if not os.path.exists(full_path):
@@ -437,11 +517,16 @@ def deepseek_ask(
         "You are an elite software architect and senior code engineer assisting on mission-critical production systems. "
         "Be precise, rigorous, and truthful."
     )
+    base_sys = system_prompt or default_sys
     if workspace:
-        default_sys += (
-            " You have access to local read-only tools: 'read_file' and 'list_files'. "
+        initial_sys = (
+            base_sys +
+            "\n\nYou have access to local read-only tools: 'read_file' and 'list_files'. "
             "Use them autonomously to inspect files in the workspace whenever you need code context before providing your verdict."
+            + TOOL_SYSTEM_DIRECTIVE
         )
+    else:
+        initial_sys = base_sys
     
     session = None
     turn_start_msg_count = 0
@@ -450,7 +535,6 @@ def deepseek_ask(
             session = load_session(session_id)
             
         if not session:
-            initial_sys = system_prompt or default_sys
             session = {
                 "session_id": session_id,
                 "messages": [{"role": "system", "content": initial_sys}],
@@ -468,7 +552,7 @@ def deepseek_ask(
         current_turn = session["turn_count"]
     else:
         messages = [
-            {"role": "system", "content": system_prompt or default_sys},
+            {"role": "system", "content": initial_sys},
             {"role": "user", "content": prompt}
         ]
         current_turn = 1
@@ -501,20 +585,32 @@ def deepseek_ask(
                 response = client.chat.completions.create(**kwargs)
                 msg = response.choices[0].message
                 all_telemetry.append(extract_telemetry(response.usage))
+                
+                tool_calls = getattr(msg, "tool_calls", None)
+                if not tool_calls and msg.content and "DSML" in msg.content:
+                    parsed_calls, clean_text = parse_dsml_tool_calls(msg.content)
+                    if parsed_calls:
+                        tool_calls = parsed_calls
+                        msg.content = clean_text
+                        try:
+                            msg.tool_calls = parsed_calls
+                        except Exception:
+                            pass
+                
                 messages.append(serialize_assistant_message(msg))
                 
-                if not getattr(msg, "tool_calls", None):
+                if not tool_calls:
                     final_content = msg.content or ""
                     final_reasoning = getattr(msg, "reasoning_content", None) or ""
                     break
                     
-                for tc in msg.tool_calls:
+                for tc in tool_calls:
                     fn_name = tc.function.name
                     try:
                         fn_args = json.loads(tc.function.arguments)
                     except Exception:
                         fn_args = {}
-                    if fn_name in ["read_file", "list_files"]:
+                    if fn_name in ["read_file", "list_files", "list_directory"]:
                         tool_out = execute_local_tool(workspace, fn_name, fn_args)
                         tools_used.append({"tool": fn_name, "args": fn_args})
                     else:
@@ -769,6 +865,7 @@ def deepseek_code_task(
         "You are an Autonomous Senior Software Engineer. You have access to local tools: read_file, write_file, edit_file_replace, run_shell, list_files. "
         "Follow the Architect's Spec strictly. Write or modify code in the workspace, and verify using the shell. "
         "When finished, summarize your changes and state 'TASK_COMPLETE'."
+        + TOOL_SYSTEM_DIRECTIVE
     )
     
     messages: List[Dict[str, Any]] = [
@@ -798,7 +895,18 @@ def deepseek_code_task(
         messages.append(msg)
         loop_telemetry.append(extract_telemetry(res.usage))
 
-        if not msg.tool_calls:
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls and msg.content and "DSML" in msg.content:
+            parsed_calls, clean_text = parse_dsml_tool_calls(msg.content)
+            if parsed_calls:
+                tool_calls = parsed_calls
+                msg.content = clean_text
+                try:
+                    msg.tool_calls = parsed_calls
+                except Exception:
+                    pass
+
+        if not tool_calls:
             # Model declares completion or gives text
             if test_cmd:
                 test_exec = subprocess.run(test_cmd, shell=True, cwd=workspace, capture_output=True, text=True, timeout=90, env=exec_env)
@@ -816,7 +924,7 @@ def deepseek_code_task(
                 test_passed = True
                 break
 
-        for tool_call in msg.tool_calls:
+        for tool_call in tool_calls:
             fn_name = tool_call.function.name
             try:
                 fn_args = json.loads(tool_call.function.arguments)
