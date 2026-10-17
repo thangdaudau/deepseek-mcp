@@ -145,20 +145,20 @@ def test_read_file_single_large_line():
         assert len(data["partial_content"]) > 0
 
 def test_read_file_multi_large_lines_paging():
-    """Kiểm tra file nhiều dòng dài chạm byte cap: next_start_line trỏ đúng dòng kế tiếp, không bị None."""
+    """Kiểm tra file nhiều dòng dài chạm byte cap (24KB): next_start_line trỏ đúng dòng kế tiếp, không bị None."""
     with tempfile.TemporaryDirectory() as tmpdir:
         large_file = os.path.join(tmpdir, "multilarge.txt")
-        # 3 dòng, mỗi dòng 100KB: dòng 1 và 2 cộng lại là 200KB, dòng 3 sẽ chạm trần 256KB
+        # 3 dòng, mỗi dòng 10KB: dòng 1 và 2 cộng lại là 20KB, dòng 3 sẽ chạm trần 24KB
         with open(large_file, "w", encoding="utf-8") as f:
-            f.write("A" * (100 * 1024) + "\n")
-            f.write("B" * (100 * 1024) + "\n")
-            f.write("C" * (100 * 1024) + "\n")
+            f.write("A" * (10 * 1024) + "\n")
+            f.write("B" * (10 * 1024) + "\n")
+            f.write("C" * (10 * 1024) + "\n")
 
         res = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "multilarge.txt", "start_line": 1}))
         assert res["truncated"] is True
         assert res["next_start_line"] == 3
         assert res["eof"] is False
-        assert len(res["content"]) > 150 * 1024
+        assert len(res["content"]) > 18 * 1024
 
 def test_read_file_vietnamese_paging():
     """Kiểm tra phân trang qua next_start_line trên file tiếng Việt không bị lỗi font mojibake."""
@@ -302,7 +302,7 @@ def test_read_file_full_file_reconstruction_property():
         cur_start = 1
         turns = 0
 
-        while cur_start is not None and turns < 50:
+        while cur_start is not None and turns < 100:
             turns += 1
             res_raw = execute_local_tool(tmpdir, "read_file", {"path": "large_source.txt", "start_line": cur_start})
             data = json.loads(res_raw)
@@ -314,5 +314,40 @@ def test_read_file_full_file_reconstruction_property():
         reconstructed_text = "".join(reconstructed_parts)
         assert reconstructed_text == original_text
         assert turns > 1  # Đảm bảo đã thực sự phân qua nhiều trang
+
+def test_run_capped_hang_with_capped_output():
+    """Kiểm tra C1: Lệnh vừa nhả > 128KB vừa bị treo/sleep thì timeout vẫn kích hoạt và kill sạch, không bị nuốt thành capped."""
+    from server import _run_capped
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Lệnh in 150KB rồi sleep 10s (với timeout=1s)
+        cmd = 'python3 -c "import sys, time; sys.stdout.write(\'X\' * 150000); sys.stdout.flush(); time.sleep(10)"'
+        start = time.time()
+        out, rc, flag = _run_capped(cmd, tmpdir, os.environ.copy(), timeout=1, cap=128 * 1024, kill_on_cap=False)
+        elapsed = time.time() - start
+        assert elapsed < 4.0  # Không bị treo 10s
+        assert flag == "timeout"
+        assert "COMMAND TIMED OUT" in out
+
+def test_env_scrubbing_preserves_ssh_auth_sock():
+    """Kiểm tra C5: build_scrubbed_env tẩy sạch secret token nhưng bảo toàn SSH_AUTH_SOCK cho git-over-ssh."""
+    from server import build_scrubbed_env
+    old_val = os.environ.get("SSH_AUTH_SOCK")
+    old_secret = os.environ.get("MY_API_KEY")
+    try:
+        os.environ["SSH_AUTH_SOCK"] = "/tmp/ssh-agent.sock"
+        os.environ["MY_API_KEY"] = "sk-secret-123456"
+        env = build_scrubbed_env()
+        assert env.get("SSH_AUTH_SOCK") == "/tmp/ssh-agent.sock"
+        assert "MY_API_KEY" not in env
+    finally:
+        if old_val:
+            os.environ["SSH_AUTH_SOCK"] = old_val
+        else:
+            os.environ.pop("SSH_AUTH_SOCK", None)
+        if old_secret:
+            os.environ["MY_API_KEY"] = old_secret
+        else:
+            os.environ.pop("MY_API_KEY", None)
+
 
 

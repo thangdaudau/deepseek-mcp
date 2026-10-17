@@ -124,7 +124,7 @@ def test_live_code_task_e2e():
             thinking=True,
             effort="high",
             run_adversarial_review=True,
-            max_turns=6
+            max_turns=8
         )
 
         report = json.loads(raw_report)

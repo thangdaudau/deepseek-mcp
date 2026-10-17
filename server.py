@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-MAX_READ_BYTES = 256 * 1024       # 256KB hard cap per read
+MAX_READ_BYTES = 24 * 1024        # 24KB content per page, fits within MAX_TOOL_RESULT (32KB) envelope cleanly
 MAX_READ_LINES = 2000             # 2000 lines max per read
 CHUNK_SIZE = 64 * 1024            # 64KB chunk streaming
 MAX_TOOL_RESULT = 32_000          # 32,000 chars per-tool-call cap in messages
@@ -39,7 +39,7 @@ MAX_SESSION_BYTES = 8 * 1024 * 1024 # 8MB max session JSON on disk
 MAX_SHELL_OUT = 128 * 1024        # 128KB output cap for shell commands
 
 DANGEROUS_COMMAND_PATTERNS = [
-    r"\brm\s+.*(-[a-zA-Z0-9]*[rfRF]|--recursive|--force).*\s+(/|~|\$HOME|\*)(\s|$)",
+    r"\brm\s+.*(-[a-zA-Z0-9]*[rfRF]|--recursive|--force).*\s+(/|~|\$HOME|\*|/\*)(\s|$)",
     r"\bmkfs(\.[a-z0-9]+)?(\s|$)",
     r"\bdd\s+.*(if=|of=/dev/)",
     r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
@@ -48,7 +48,8 @@ DANGEROUS_COMMAND_PATTERNS = [
     r"\bshutdown(\s|$)",
     r"\breboot(\s|$)",
     r"\bpoweroff(\s|$)",
-    r"\b(chmod|chown)\s+-[rR]\s+.*(/|~)(\s|$)"
+    r"\b(chmod|chown)\s+-[rR]\s+.*(/|~|\$HOME)(\s|$)",
+    r"\bchmod\s+[0-7]{3,4}\s+.*(/|~|\$HOME)(\s|$)"
 ]
 
 server = MCPServer("DeepSeek-MCP")
@@ -72,6 +73,8 @@ def tool_guard(fn):
                 }
             }, ensure_ascii=False)
         except Exception as e:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             return json.dumps({
                 "status": "ERROR",
                 "error": {
@@ -112,10 +115,10 @@ def get_client() -> OpenAI:
 SENSITIVE_ENV_KEYWORDS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH")
 
 def build_scrubbed_env() -> Dict[str, str]:
-    """Tẩy sạch các biến môi trường chứa secret trực tiếp khỏi env của child process nhưng giữ nguyên HOME và toolchain."""
+    """Tẩy sạch các biến môi trường chứa secret trực tiếp khỏi env của child process nhưng giữ nguyên HOME, SSH credentials và toolchain."""
     scrubbed = {
         k: v for k, v in os.environ.items()
-        if not any(kw in k.upper() for kw in SENSITIVE_ENV_KEYWORDS)
+        if k in ("SSH_AUTH_SOCK", "SSH_AGENT_PID") or not any(kw in k.upper() for kw in SENSITIVE_ENV_KEYWORDS)
     }
     venv_bin = os.path.dirname(sys.executable)
     scrubbed["PATH"] = f"{venv_bin}{os.pathsep}{scrubbed.get('PATH', '')}"
@@ -144,8 +147,8 @@ def is_safe_path(base_dir: str, target_path: str) -> Tuple[bool, str]:
     if filename == ".env" or (filename.startswith(".env.") and not filename.endswith((".example", ".template", ".sample"))):
         return False, target
 
-    # Chặn private keys và certificates
-    if filename.endswith((".pem", ".key", ".p12", ".pfx")):
+    # Chặn private keys, certificates và netrc
+    if filename in ("id_rsa", "id_ed25519", "id_ecdsa", "id_dsa", ".netrc") or filename.endswith((".pem", ".key", ".p12", ".pfx")):
         return False, target
 
     return True, target
@@ -270,22 +273,32 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
             return None
     return None
 
-def save_session(session_id: str, data: Dict[str, Any]) -> None:
-    """Ghi bền vững và nguyên tử (atomic write) session xuống file JSON trên đĩa."""
+def save_session(session_id: str, data: Dict[str, Any]) -> bool:
+    """Ghi bền vững và nguyên tử (atomic write) session xuống file JSON trên đĩa, enforce trần MAX_SESSION_BYTES."""
     file_path = get_session_file(session_id)
     dir_name = os.path.dirname(file_path)
     os.makedirs(dir_name, exist_ok=True)
     temp_path = None
     try:
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        # Nếu payload vượt quá trần MAX_SESSION_BYTES (8MB), tỉa bớt tin nhắn lịch sử cũ
+        if len(payload.encode("utf-8")) > MAX_SESSION_BYTES:
+            msgs = data.get("messages", [])
+            if len(msgs) > 10:
+                data["messages"] = [msgs[0]] + msgs[-8:]
+                payload = json.dumps(data, ensure_ascii=False, indent=2)
+
         with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
-            temp_path = tf.name   # Gán NGAY trước khi dump, chống leak file nếu dump fail
-            json.dump(data, tf, ensure_ascii=False, indent=2)
+            temp_path = tf.name   # Gán NGAY trước khi ghi, chống leak file nếu fail
+            tf.write(payload)
             tf.flush()
             os.fsync(tf.fileno())
         os.replace(temp_path, file_path)
         temp_path = None
+        return True
     except Exception as e:
         sys.stderr.write(f"Error saving session {session_id}: {str(e)}\n")
+        return False
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -510,7 +523,10 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
             break
         time.sleep(0.05)
 
-    if state["capped"]:
+    # C1: Ưu tiên timeout > capped để chống nuốt timeout khi kill_on_cap=False
+    if time.monotonic() > deadline:
+        flag = "timeout"
+    elif state["capped"]:
         flag = "capped"
 
     # Chỉ kill khi timeout hoặc khi chạm cap với kill_on_cap=True
@@ -523,6 +539,15 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    # C2: Đảm bảo dọn sạch các tiến trình con cháu (orphaned grandchildren) tránh rò rỉ pipe
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
         pass
 
     t.join(timeout=2)
@@ -617,8 +642,12 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
 
                 # Chặn trường hợp 1 dòng đơn lẻ dài vượt trần MAX_READ_BYTES không có dấu \n
                 if len(tail) >= MAX_READ_BYTES:
-                    truncated = True
-                    break
+                    if line_no + 1 >= start:
+                        truncated = True
+                        break
+                    else:
+                        # Đang ở giai đoạn skip trước start_line, xả bớt tail để tiếp tục đếm dòng
+                        tail = b""
 
             if not truncated and tail:
                 line_no += 1
@@ -684,10 +713,19 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         safe, full_path = is_safe_path(workspace, rel_path)
         if not safe:
             return f"Error: Path '{rel_path}' nằm ngoài workspace!"
+        if os.path.exists(full_path):
+            st = os.stat(full_path)
+            if not stat.S_ISREG(st.st_mode):
+                return f"Error: '{rel_path}' không phải regular file (chặn FIFO / device file)."
         try:
-            os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            dir_name = os.path.dirname(full_path)
+            os.makedirs(dir_name, exist_ok=True)
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                temp_p = tf.name
+                tf.write(content)
+                tf.flush()
+                os.fsync(tf.fileno())
+            os.replace(temp_p, full_path)
             return f"Successfully wrote {len(content)} characters to '{rel_path}'."
         except Exception as e:
             return f"Error writing file: {str(e)}"
@@ -701,8 +739,13 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
             return f"Error: Path '{rel_path}' nằm ngoài workspace!"
         if not os.path.exists(full_path):
             return f"Error: File '{rel_path}' không tồn tại."
+        st = os.stat(full_path)
+        if not stat.S_ISREG(st.st_mode):
+            return f"Error: '{rel_path}' không phải regular file (chặn FIFO / device file)."
+        if st.st_size > 5 * 1024 * 1024:
+            return f"Error: File '{rel_path}' quá lớn ({st.st_size} bytes > 5MB), không hỗ trợ replace trực tiếp."
         try:
-            with open(full_path, "r", encoding="utf-8") as f:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 current_text = f.read()
             if search_block not in current_text:
                 return f"Error: search_block không tìm thấy trong file '{rel_path}'."
@@ -710,8 +753,13 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
             if count > 1:
                 return f"Error: search_block xuất hiện {count} lần trong file. Phải cung cấp thêm ngữ cảnh xung quanh để xác định duy nhất."
             new_text = current_text.replace(search_block, replace_block, 1)
-            with open(full_path, "w", encoding="utf-8") as f:
-                f.write(new_text)
+            dir_name = os.path.dirname(full_path)
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+                temp_p = tf.name
+                tf.write(new_text)
+                tf.flush()
+                os.fsync(tf.fileno())
+            os.replace(temp_p, full_path)
             return f"Successfully replaced search block in '{rel_path}'."
         except Exception as e:
             return f"Error editing file: {str(e)}"
@@ -865,17 +913,23 @@ def deepseek_ask(
                         final_reasoning = getattr(msg, "reasoning_content", None) or ""
                         break
                         
-                    for tc in msg.tool_calls:
+                    for i, tc in enumerate(msg.tool_calls):
                         fn_name = tc.function.name
                         try:
                             fn_args = json.loads(tc.function.arguments)
                         except Exception:
                             fn_args = {}
-                        if fn_name in ["read_file", "list_files", "list_directory"]:
-                            tool_out = execute_local_tool(workspace, fn_name, fn_args)
-                            tools_used.append({"tool": fn_name, "args": fn_args})
-                        else:
-                            tool_out = f"Error: Tool '{fn_name}' không được phép trong chế độ read-only!"
+                        if not isinstance(fn_args, dict):
+                            fn_args = {}
+                        tc_id = getattr(tc, "id", f"call_{i}")
+                        try:
+                            if fn_name in ["read_file", "list_files", "list_directory"]:
+                                tool_out = execute_local_tool(workspace, fn_name, fn_args)
+                                tools_used.append({"tool": fn_name, "args": fn_args})
+                            else:
+                                tool_out = f"Error: Tool '{fn_name}' không được phép trong chế độ read-only!"
+                        except Exception as te:
+                            tool_out = f"Tool execution error: {str(te)}"
                             
                         # Cap 32.000 ký tự cho từng lệnh gọi tool đơn lẻ (per-tool-call)
                         str_out = str(tool_out)
@@ -884,7 +938,7 @@ def deepseek_ask(
 
                         messages.append({
                             "role": "tool",
-                            "tool_call_id": tc.id,
+                            "tool_call_id": tc_id,
                             "content": str_out
                         })
                         
@@ -1228,6 +1282,13 @@ def deepseek_code_task(
                 "tool_call_id": tool_call.id,
                 "content": str_out
             })
+
+    # Nghiệm thu tự động cuối cùng với test_cmd nếu chưa được verify ở turn cuối
+    if not test_passed and test_cmd:
+        test_out, test_rc, test_flag = _run_capped(test_cmd, workspace, exec_env, timeout=90, kill_on_cap=False)
+        last_test_output = test_out
+        if test_rc == 0:
+            test_passed = True
 
     # 4. Thu thập Git Diff an toàn
     git_diff = ""
