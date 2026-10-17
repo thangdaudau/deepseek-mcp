@@ -298,13 +298,14 @@ def test_read_file_full_file_reconstruction_property():
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(original_text)
 
+        # 1. Kiểm tra raw mode (line_numbers=False): tái tạo 100% byte gốc
         reconstructed_parts = []
         cur_start = 1
         turns = 0
 
         while cur_start is not None and turns < 100:
             turns += 1
-            res_raw = execute_local_tool(tmpdir, "read_file", {"path": "large_source.txt", "start_line": cur_start})
+            res_raw = execute_local_tool(tmpdir, "read_file", {"path": "large_source.txt", "start_line": cur_start, "line_numbers": False})
             data = json.loads(res_raw)
             reconstructed_parts.append(data["content"])
             if data["eof"]:
@@ -314,6 +315,45 @@ def test_read_file_full_file_reconstruction_property():
         reconstructed_text = "".join(reconstructed_parts)
         assert reconstructed_text == original_text
         assert turns > 1  # Đảm bảo đã thực sự phân qua nhiều trang
+
+        # 2. Kiểm tra default mode (line_numbers=True): đánh số dòng chính xác cả khi nhảy cóc
+        page1 = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "large_source.txt", "start_line": 1, "line_count": 3}))
+        assert "1: Dòng 1:" in page1["content"]
+        assert "2: Dòng 2:" in page1["content"]
+        assert "3: Dòng 3:" in page1["content"]
+        assert page1["line_numbers"] is True
+
+        # Nhảy cóc đến dòng 500
+        page_jump = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "large_source.txt", "start_line": 500, "line_count": 3}))
+        assert "500: Dòng 500:" in page_jump["content"]
+        assert "501: Dòng 501:" in page_jump["content"]
+        assert "502: Dòng 502:" in page_jump["content"]
+
+def test_edit_file_replace_auto_strip_line_numbers():
+    """Kiểm tra edit_file_replace tự động bóc tách số dòng nếu LLM copy từ read_file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filepath = os.path.join(tmpdir, "sample.py")
+        code = "def hello():\n    print('Hello')\n    return 42\n"
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        # Mô phỏng LLM đọc file và copy nguyên đoạn có tiền tố số dòng vào search_block
+        search_block_with_numbers = "2:     print('Hello')\n3:     return 42\n"
+        replace_block_with_numbers = "2:     print('World')\n3:     return 100\n"
+
+        res = execute_local_tool(tmpdir, "edit_file_replace", {
+            "path": "sample.py",
+            "search_block": search_block_with_numbers,
+            "replace_block": replace_block_with_numbers
+        })
+
+        assert "Successfully replaced search block" in res
+        with open(filepath, "r", encoding="utf-8") as f:
+            new_code = f.read()
+        assert "print('World')" in new_code
+        assert "return 100" in new_code
+        # Chắc chắn số dòng '2: ' hay '3: ' không bị chèn vào mã nguồn file thật
+        assert "2:" not in new_code
 
 def test_run_capped_hang_with_capped_output():
     """Kiểm tra C1: Lệnh vừa nhả > 128KB vừa bị treo/sleep thì timeout vẫn kích hoạt và kill sạch, không bị nuốt thành capped."""

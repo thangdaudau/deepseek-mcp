@@ -431,13 +431,14 @@ READ_ONLY_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Đọc nội dung file trong workspace (hỗ trợ phân trang an toàn). Trả về JSON envelope gồm content và thông tin phân trang.",
+            "description": "Đọc nội dung file trong workspace (hỗ trợ phân trang an toàn). Mặc định mỗi dòng trong 'content' được đánh số '<line_number>: <mã nguồn>' để định vị chuẩn xác. Khi dùng edit_file_replace, KHÔNG đưa tiền tố số dòng vào search_block.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Đường dẫn file tương đối trong workspace"},
                     "start_line": {"type": "integer", "description": "Dòng bắt đầu đọc (1-indexed, mặc định: 1)"},
-                    "line_count": {"type": "integer", "description": "Số dòng cần đọc tối đa (mặc định: đọc tối đa 2000 dòng hoặc tới 24KB)"}
+                    "line_count": {"type": "integer", "description": "Số dòng cần đọc tối đa (mặc định: đọc tối đa 2000 dòng hoặc tới 24KB)"},
+                    "line_numbers": {"type": "boolean", "description": "Nếu True, thêm tiền tố số dòng '<line_number>: ' vào đầu mỗi dòng trong content (mặc định: True)."}
                 },
                 "required": ["path"]
             }
@@ -515,7 +516,9 @@ TOOL_SYSTEM_DIRECTIVE = (
     "3. NO RAW MARKUP: Rely strictly on native tool calls. Never emit raw DSML or XML tags into conversation text.\n"
     "4. SYNTHESIS: Provide your comprehensive analysis or verdict only after all necessary tools have returned their results.\n"
     "5. PAGINATION PROTOCOL: If 'read_file' returns 'truncated': true, invoke 'read_file' again with 'start_line'=next_start_line "
-    "to read subsequent content. Never guess or hallucinate missing file lines."
+    "to read subsequent content. Never guess or hallucinate missing file lines.\n"
+    "6. LINE NUMBERS PROTOCOL: 'read_file' prefixes each line with '<line_number>: ' for exact navigation. "
+    "When applying edits via 'edit_file_replace', you MUST STRIP these line number prefixes from 'search_block' and 'replace_block'."
 )
 
 def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
@@ -639,7 +642,7 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     rc = proc.returncode if proc.returncode is not None else -9
     return text, rc, flag
 
-def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line_count: Any = None) -> str:
+def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line_count: Any = None, line_numbers: Any = True) -> str:
     """Đọc file theo chunking nhị phân, chống OOM, chống vỡ tiếng Việt, trả JSON envelope."""
     safe, full_path = is_safe_path(workspace, rel_path)
     if not safe:
@@ -661,6 +664,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
 
     start = max(1, _as_int(start_line, 1))
     want = MAX_READ_LINES if line_count is None else max(1, min(_as_int(line_count, MAX_READ_LINES), MAX_READ_LINES))
+    use_line_numbers = True if line_numbers is None else bool(line_numbers)
 
     if st.st_size == 0 or start > st.st_size:
         return json.dumps({
@@ -670,6 +674,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
             "next_start_line": None,
             "truncated": False,
             "eof": True,
+            "line_numbers": use_line_numbers,
             "file_size": st.st_size,
             "bytes_returned": 0,
             "next_step": None,
@@ -758,7 +763,10 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
 
     eof = (next_start is None and not truncated)
     end_line = start + len(out) - 1 if out else start - 1
-    body = "".join(out)
+    if use_line_numbers:
+        body = "".join(f"{start + idx}: {line_str}" for idx, line_str in enumerate(out))
+    else:
+        body = "".join(out)
 
     return json.dumps({
         "path": rel_path,
@@ -767,6 +775,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
         "next_start_line": next_start,
         "truncated": truncated,
         "eof": eof,
+        "line_numbers": use_line_numbers,
         "file_size": st.st_size,
         "bytes_returned": emitted_bytes,
         "next_step": f"call read_file with start_line={next_start}" if next_start else None,
@@ -779,7 +788,8 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         rel_path = args.get("path", "")
         start_line = args.get("start_line", 1)
         line_count = args.get("line_count", None)
-        return _read_file_envelope(workspace, rel_path, start_line, line_count)
+        line_numbers = args.get("line_numbers", True)
+        return _read_file_envelope(workspace, rel_path, start_line, line_count, line_numbers)
             
     elif name == "write_file":
         rel_path = args.get("path", "")
@@ -843,6 +853,32 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                     current_text = f.read()
             except UnicodeDecodeError:
                 return f"Error: File '{rel_path}' không phải định dạng UTF-8 hợp lệ, từ chối chỉnh sửa để chống hỏng dữ liệu."
+
+            if search_block not in current_text:
+                # Fallback: Tự động bóc tách tiền tố số dòng nếu model copy từ read_file (ví dụ "42: code")
+                stripped_lines = []
+                has_line_no = False
+                for line in search_block.splitlines(keepends=True):
+                    le = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+                    content_part = line[:-len(le)] if le else line
+                    m = re.match(r"^[ \t]*\d+[:|][ \t]?(.*)$", content_part)
+                    if m:
+                        has_line_no = True
+                        stripped_lines.append(m.group(1) + le)
+                    else:
+                        stripped_lines.append(line)
+                if has_line_no:
+                    candidate = "".join(stripped_lines)
+                    if candidate in current_text:
+                        search_block = candidate
+                        # Bóc tách tương tự cho replace_block nếu replace_block cũng chứa số dòng
+                        r_stripped = []
+                        for r_line in replace_block.splitlines(keepends=True):
+                            r_le = "\r\n" if r_line.endswith("\r\n") else ("\n" if r_line.endswith("\n") else "")
+                            r_content = r_line[:-len(r_le)] if r_le else r_line
+                            rm = re.match(r"^[ \t]*\d+[:|][ \t]?(.*)$", r_content)
+                            r_stripped.append((rm.group(1) + r_le) if rm else r_line)
+                        replace_block = "".join(r_stripped)
 
             if search_block not in current_text:
                 return f"Error: search_block không tìm thấy trong file '{rel_path}'."
@@ -1152,6 +1188,13 @@ def deepseek_session_clear(session_id: Optional[str] = None) -> str:
         }, ensure_ascii=False)
 
     sid = session_id.strip()
+    if sid.lower() in ("reload", "restart"):
+        def _exit_soon():
+            time.sleep(0.1)
+            os._exit(0)
+        threading.Thread(target=_exit_soon, daemon=True).start()
+        return json.dumps({"status": "SUCCESS", "message": "Tiến trình MCP server đang tự làm mới để nạp code mới..."}, ensure_ascii=False)
+
     if sid.lower() == "all":
         count = delete_all_sessions()
         return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
