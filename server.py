@@ -273,7 +273,7 @@ def _normalize_session(session_id: str, data: Optional[Dict[str, Any]], system_p
     }
 
 def load_session(session_id: str) -> Optional[Dict[str, Any]]:
-    """Tải session từ Hot Plane (RAM) hoặc phục hồi từ Cold Plane (WAL với CRC32) trên đĩa."""
+    """Tải session từ Hot Plane (RAM) hoặc phục hồi tuần tự từ Cold Plane (True Delta WAL với CRC32) trên đĩa."""
     now = time.time()
 
     # 1. Hot Plane (RAM)
@@ -287,7 +287,7 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
     # 2. Cold Plane (WAL: .wal.jsonl)
     wal_path = get_session_file(session_id)
     if os.path.exists(wal_path):
-        last_valid_data = None
+        current_session = None
         try:
             with open(wal_path, "r", encoding="utf-8") as f:
                 for line in f:
@@ -298,22 +298,63 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
                         record = json.loads(line)
                         crc = record.get("crc")
                         payload_str = record.get("payload")
-                        if payload_str is not None and crc is not None:
-                            calc_crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
-                            if calc_crc == crc:
-                                last_valid_data = json.loads(payload_str)
-                            else:
-                                sys.stderr.write(f"Warning: Corrupt WAL frame in session {session_id} (CRC mismatch)\n")
+                        if payload_str is None or crc is None:
+                            continue
+                        calc_crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
+                        if calc_crc != crc:
+                            sys.stderr.write(f"Warning: Corrupt WAL frame in session {session_id} (CRC mismatch)\n")
+                            continue
+
+                        p = json.loads(payload_str)
+                        rec_type = p.get("type")
+
+                        if rec_type == "init":
+                            current_session = {
+                                "session_id": p.get("session_id", session_id),
+                                "system_prompt": p.get("system_prompt", ""),
+                                "messages": list(p.get("messages", [])),
+                                "turn_count": p.get("turn", 0),
+                                "created_at": p.get("created_at", record.get("ts", now)),
+                                "updated_at": record.get("ts", now),
+                                "schema_version": 2
+                            }
+                        elif rec_type == "turn":
+                            if current_session is None:
+                                current_session = {
+                                    "session_id": session_id,
+                                    "system_prompt": "",
+                                    "messages": [],
+                                    "turn_count": 0,
+                                    "created_at": record.get("ts", now),
+                                    "updated_at": record.get("ts", now),
+                                    "schema_version": 2
+                                }
+                            delta = p.get("delta", [])
+                            if isinstance(delta, list):
+                                current_session["messages"].extend(delta)
+                            current_session["turn_count"] = p.get("turn", current_session["turn_count"] + 1)
+                            current_session["updated_at"] = p.get("ts", record.get("ts", now))
+                        else:
+                            # rec_type == "snapshot" hoặc legacy full payload
+                            current_session = {
+                                "session_id": p.get("session_id", session_id),
+                                "system_prompt": p.get("system_prompt", ""),
+                                "messages": list(p.get("messages", [])),
+                                "turn_count": p.get("turn", p.get("turn_count", 0)),
+                                "created_at": p.get("created_at", now),
+                                "updated_at": p.get("updated_at", record.get("ts", now)),
+                                "schema_version": 2
+                            }
                     except Exception as parse_err:
                         sys.stderr.write(f"Warning: Invalid WAL line in session {session_id}: {parse_err}\n")
                         continue
 
-            if last_valid_data is not None:
-                if now - last_valid_data.get("updated_at", 0) > SESSION_TTL_SECONDS:
+            if current_session is not None:
+                if now - current_session.get("updated_at", 0) > SESSION_TTL_SECONDS:
                     delete_session(session_id)
                     return None
-                _HOT_SESSIONS[session_id] = copy.deepcopy(last_valid_data)
-                return last_valid_data
+                _HOT_SESSIONS[session_id] = copy.deepcopy(current_session)
+                return current_session
         except Exception as e:
             sys.stderr.write(f"Error reading WAL for session {session_id}: {e}\n")
 
@@ -411,32 +452,32 @@ def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX
 
     return pruned
 
-def save_session(session_id: str, data: Dict[str, Any]) -> bool:
-    """Ghi session: cập nhật Hot Plane RAM và ghi nối tiếp (append-only WAL) kèm CRC-32."""
+def save_session(
+    session_id: str,
+    data: Dict[str, Any],
+    delta_messages: Optional[List[Dict[str, Any]]] = None
+) -> bool:
+    """
+    Ghi session theo chuẩn True Delta Append-Only (O(n)):
+    - Khởi tạo (Turn 1): Ghi 1 dòng 'init' (system prompt + tin nhắn ban đầu).
+    - Các lượt tiếp theo (Turn 2..N): CHỈ append đúng các message mới sinh ra (delta), O(1) mỗi turn.
+    - Compaction: Chỉ nén về 1 snapshot khi messages vượt quá MAX_SESSION_BYTES (8MB) hoặc đạt >= 30 dòng.
+    """
     try:
-        # Nếu session có messages, tỉa theo ranh giới turn boundary hợp lệ trước khi serialize
-        if "messages" in data and isinstance(data["messages"], list):
-            data["messages"] = _prune_session_messages(data["messages"], MAX_SESSION_BYTES)
-
-        # Serialize compact payload và tính CRC-32
-        payload_str = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
-        crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
-        wal_record = json.dumps({
-            "crc": crc,
-            "ts": time.time(),
-            "payload": payload_str
-        }, ensure_ascii=False) + "\n"
-
         wal_path = get_session_file(session_id)
         dir_name = os.path.dirname(wal_path)
         os.makedirs(dir_name, exist_ok=True)
 
-        # Compaction check: nếu file đã vượt quá 30 frames hoặc > 512KB, nén về snapshot duy nhất
+        is_new_file = not os.path.exists(wal_path) or os.path.getsize(wal_path) == 0
+
+        # Compaction check:
+        # 1. Số dòng trong file WAL >= 30
+        # 2. Hoặc file size vượt trần an toàn 16MB (gấp đôi MAX_SESSION_BYTES = 8MB)
         should_compact = False
-        if os.path.exists(wal_path):
+        if not is_new_file:
             try:
                 st = os.stat(wal_path)
-                if st.st_size > 512 * 1024:
+                if st.st_size > 16 * 1024 * 1024:
                     should_compact = True
                 else:
                     with open(wal_path, "r", encoding="utf-8") as f:
@@ -446,7 +487,27 @@ def save_session(session_id: str, data: Dict[str, Any]) -> bool:
             except Exception:
                 pass
 
+        if "messages" in data and isinstance(data["messages"], list):
+            data["messages"] = _prune_session_messages(data["messages"], MAX_SESSION_BYTES)
+
+        now = time.time()
+
         if should_compact:
+            # Ghi snapshot toàn vẹn thu gọn
+            snap_payload = {
+                "type": "snapshot",
+                "session_id": session_id,
+                "system_prompt": data.get("system_prompt", ""),
+                "turn": data.get("turn_count", 0),
+                "messages": data.get("messages", []),
+                "created_at": data.get("created_at", now),
+                "updated_at": now,
+                "schema_version": 2
+            }
+            snap_str = json.dumps(snap_payload, ensure_ascii=False, separators=(',', ':'))
+            crc = zlib.crc32(snap_str.encode("utf-8")) & 0xFFFFFFFF
+            wal_record = json.dumps({"crc": crc, "ts": now, "payload": snap_str}, ensure_ascii=False) + "\n"
+
             temp_path = None
             try:
                 with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
@@ -468,12 +529,50 @@ def save_session(session_id: str, data: Dict[str, Any]) -> bool:
                     except Exception:
                         pass
         else:
-            is_new = not os.path.exists(wal_path)
+            if is_new_file:
+                # Dòng đầu tiên của file: Khởi tạo session (init frame)
+                all_msgs = data.get("messages", [])
+                init_payload = {
+                    "type": "init",
+                    "session_id": session_id,
+                    "system_prompt": data.get("system_prompt", ""),
+                    "turn": data.get("turn_count", 1),
+                    "messages": all_msgs,
+                    "created_at": data.get("created_at", now),
+                    "schema_version": 2
+                }
+                payload_str = json.dumps(init_payload, ensure_ascii=False, separators=(',', ':'))
+            else:
+                # Dòng tiếp theo: Chỉ ghi Delta messages mới sinh ra trong turn này
+                actual_delta = delta_messages
+                if actual_delta is None:
+                    if session_id in _HOT_SESSIONS:
+                        prev_msgs = _HOT_SESSIONS[session_id].get("messages", [])
+                        curr_msgs = data.get("messages", [])
+                        if len(curr_msgs) >= len(prev_msgs) and curr_msgs[:len(prev_msgs)] == prev_msgs:
+                            actual_delta = curr_msgs[len(prev_msgs):]
+                        else:
+                            actual_delta = curr_msgs
+                    else:
+                        actual_delta = data.get("messages", [])
+
+                turn_payload = {
+                    "type": "turn",
+                    "turn": data.get("turn_count", 1),
+                    "delta": actual_delta,
+                    "ts": now
+                }
+                payload_str = json.dumps(turn_payload, ensure_ascii=False, separators=(',', ':'))
+
+            crc = zlib.crc32(payload_str.encode("utf-8")) & 0xFFFFFFFF
+            wal_record = json.dumps({"crc": crc, "ts": now, "payload": payload_str}, ensure_ascii=False) + "\n"
+
             with open(wal_path, "a", encoding="utf-8") as f:
                 f.write(wal_record)
                 f.flush()
                 os.fsync(f.fileno())
-            if is_new:
+
+            if is_new_file:
                 dfd = os.open(dir_name, os.O_RDONLY | os.O_DIRECTORY)
                 try:
                     os.fsync(dfd)
@@ -1357,7 +1456,7 @@ def deepseek_ask(
             if session_id and session:
                 session["messages"] = messages
                 session["updated_at"] = time.time()
-                save_session(session_id, session)
+                save_session(session_id, session, delta_messages=messages[turn_start_msg_count:])
                 
             result = {
                 "session_id": session_id,
@@ -1380,7 +1479,7 @@ def deepseek_ask(
             if session_id and session:
                 session["messages"] = session["messages"][:turn_start_msg_count]
                 session["turn_count"] -= 1
-                save_session(session_id, session)
+                _HOT_SESSIONS[session_id] = copy.deepcopy(session)
             return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
 
     if session_id:

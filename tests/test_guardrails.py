@@ -800,3 +800,73 @@ def test_edit_file_replace_crlf_lf_cross_normalization(tmp_path):
     assert "Successfully replaced" in res3
     content3 = numbered_crlf.read_bytes()
     assert b"foo\r\nbar_new\r\nbaz\r\n" == content3
+
+
+def test_true_delta_append_only_linear_storage():
+    """Kiểm chứng True Delta WAL (O(n)): mỗi turn CHỈ ghi đúng delta tin nhắn mới, không lặp lại quá khứ."""
+    from server import save_session, load_session, delete_session, get_session_file, _HOT_SESSIONS
+    import json
+    
+    sid = "test-true-delta-wal"
+    delete_session(sid)
+    wal_path = get_session_file(sid)
+    
+    sys_msg = {"role": "system", "content": "You are a helpful assistant."}
+    u1 = {"role": "user", "content": "hello turn 1"}
+    a1 = {"role": "assistant", "content": "reply turn 1"}
+    
+    # 1. Ghi Turn 1
+    t1_data = {
+        "session_id": sid,
+        "system_prompt": "You are a helpful assistant.",
+        "messages": [sys_msg, u1, a1],
+        "turn_count": 1,
+        "created_at": 2000000000.0,
+        "updated_at": 2000000000.0
+    }
+    assert save_session(sid, t1_data, delta_messages=[u1, a1]) is True
+    
+    with open(wal_path, "r", encoding="utf-8") as f:
+        lines_t1 = [l.strip() for l in f if l.strip()]
+    assert len(lines_t1) == 1
+    frame_init = json.loads(json.loads(lines_t1[0])["payload"])
+    assert frame_init["type"] == "init"
+    assert frame_init["turn"] == 1
+    assert len(frame_init["messages"]) == 3
+    
+    # 2. Ghi Turn 2: Thêm u2 và a2
+    u2 = {"role": "user", "content": "question turn 2"}
+    a2 = {"role": "assistant", "content": "answer turn 2"}
+    t2_data = {
+        "session_id": sid,
+        "system_prompt": "You are a helpful assistant.",
+        "messages": [sys_msg, u1, a1, u2, a2],
+        "turn_count": 2,
+        "created_at": 2000000000.0,
+        "updated_at": 2000000010.0
+    }
+    assert save_session(sid, t2_data, delta_messages=[u2, a2]) is True
+    
+    with open(wal_path, "r", encoding="utf-8") as f:
+        lines_t2 = [l.strip() for l in f if l.strip()]
+    assert len(lines_t2) == 2
+    frame_turn2 = json.loads(json.loads(lines_t2[1])["payload"])
+    assert frame_turn2["type"] == "turn"
+    assert frame_turn2["turn"] == 2
+    # Chứng minh Delta: Dòng 2 CHỈ chứa đúng 2 tin nhắn mới của Turn 2
+    assert frame_turn2["delta"] == [u2, a2]
+    # Tuyệt đối không lặp lại tin nhắn của Turn 1 trong payload dòng 2
+    assert "hello turn 1" not in json.dumps(frame_turn2["delta"])
+    
+    # 3. Ép Replay từ đĩa (Xóa sạch RAM Hot Plane)
+    _HOT_SESSIONS.clear()
+    replayed = load_session(sid)
+    assert replayed is not None
+    assert replayed["turn_count"] == 2
+    assert len(replayed["messages"]) == 5
+    assert replayed["messages"] == [sys_msg, u1, a1, u2, a2]
+    
+    # Dọn dẹp
+    delete_session(sid)
+    assert not os.path.exists(wal_path)
+
