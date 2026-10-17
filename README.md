@@ -11,11 +11,15 @@ Hệ thống MCP Server tích hợp DeepSeek-Flash (V4.1), hỗ trợ Thinking M
 ## Danh sách công cụ (MCP Tools)
 
 ### 1. `deepseek_ask`
-Truy vấn trực tiếp DeepSeek-Flash:
-- `prompt` (string, required): Câu hỏi hoặc yêu cầu.
+Truy vấn DeepSeek-Flash hỗ trợ suy luận logic, phản biện đa hiệp (Multi-turn) và tự động khảo sát codebase:
+- `prompt` (string, required): Nội dung câu hỏi, lập luận phản biện hoặc yêu cầu điều tra.
+- `session_id` (string, optional): ID phiên làm việc để duy trì ngữ cảnh multi-turn bền vững trên đĩa (`~/.local/share/deepseek-mcp/sessions/<session_id>.json`). Khuyến nghị ghim Conversation ID của agent.
+- `reset_session` (bool, default `False`): Xóa sạch ngữ cảnh cũ của session và bắt đầu hội thoại mới.
+- `workspace_dir` (string, optional): Đường dẫn thư mục dự án / tài liệu. Khi cung cấp, kích hoạt vòng lặp Read-Only ReAct giúp DeepSeek tự hành gọi các tool `read_file` và `list_files` để bóc tách mã nguồn trực tiếp mà không cần copy paste nội dung file vào prompt.
+- `max_tool_turns` (int, default `5`): Số lượt gọi tool tối đa trong 1 truy vấn khảo sát.
 - `thinking` (bool, default `True`): Bật/tắt suy luận CoT.
-- `effort` (string: `'low'`, `'high'`, `'max'`, default `'high'`): Mức độ suy luận.
-- `system_prompt` (string, optional): Chỉ dẫn hệ thống tĩnh để tối ưu KV Cache.
+- `effort` (string: `'low'`, `'high'`, `'max'`, default `'high'`): Mức độ suy luận CoT.
+- `system_prompt` (string, optional): Chỉ dẫn hệ thống tĩnh để tối ưu KV Cache Prefix Matching.
 
 ### 2. `deepseek_code_task`
 Tự động thực hiện chu trình: **Lập Spec (Architect CoT)** -> **Sửa file & chạy test (Coder ReAct)** -> **Tự phản biện (Doubt Gate)**:
@@ -33,7 +37,11 @@ Persona phản biện độc lập (Doubt-Driven) mang tâm thế "bác bỏ, t�
 - `context_spec` (string, optional): Tài liệu yêu cầu / hợp đồng chức năng.
 - `effort` (string: `'high'` hoặc `'max'`, default `'high'`).
 
-### 4. `deepseek_health`
+### 4. `deepseek_session_clear`
+Quản lý và giải phóng session trên đĩa:
+- `session_id` (string, optional): ID session cần xóa. Nếu truyền `"all"`, toàn bộ session cache sẽ được dọn sạch.
+
+### 5. `deepseek_health`
 Kiểm tra tình trạng kết nối tới DeepSeek API, đo latency và kiểm tra token.
 
 ## Chốt chặn an toàn (Guardrails)

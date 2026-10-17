@@ -24,11 +24,29 @@ async def test_server_tools_registered():
     assert "reset_session" in ask_tool.input_schema.get("properties", {})
     assert "thinking" in ask_tool.input_schema.get("properties", {})
     assert "effort" in ask_tool.input_schema.get("properties", {})
+    assert "workspace_dir" in ask_tool.input_schema.get("properties", {})
+    assert "max_tool_turns" in ask_tool.input_schema.get("properties", {})
 
     code_task_tool = next(t for t in tools if t.name == "deepseek_code_task")
     assert "workspace_dir" in code_task_tool.input_schema.get("properties", {})
     assert "task" in code_task_tool.input_schema.get("properties", {})
     assert "test_cmd" in code_task_tool.input_schema.get("properties", {})
+
+def test_read_only_tools_schema_isolation():
+    from server import READ_ONLY_TOOLS_SCHEMA, LOCAL_TOOLS_SCHEMA
+    
+    ro_tool_names = [t["function"]["name"] for t in READ_ONLY_TOOLS_SCHEMA]
+    assert "read_file" in ro_tool_names
+    assert "list_files" in ro_tool_names
+    # Ensure mutating tools are strictly forbidden in read-only schema
+    assert "write_file" not in ro_tool_names
+    assert "edit_file_replace" not in ro_tool_names
+    assert "run_shell" not in ro_tool_names
+    
+    all_tool_names = [t["function"]["name"] for t in LOCAL_TOOLS_SCHEMA]
+    assert "write_file" in all_tool_names
+    assert "run_shell" in all_tool_names
+
 
 def test_ask_session_lifecycle():
     import json

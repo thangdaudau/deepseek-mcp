@@ -191,206 +191,14 @@ def cleanup_expired_sessions() -> None:
         pass
 
 # ---------------------------------------------------------------------------
-# Tool 1: deepseek_ask (Trực tiếp suy luận hoặc truy vấn DeepSeek Flash)
+# Local Workspace Tools & Schemas (Read-only vs Full Execution)
 # ---------------------------------------------------------------------------
-@server.tool()
-def deepseek_ask(
-    prompt: str,
-    session_id: Optional[str] = None,
-    reset_session: bool = False,
-    thinking: bool = True,
-    effort: str = "high",
-    system_prompt: Optional[str] = None
-) -> str:
-    """
-    Truy vấn DeepSeek-Flash, hỗ trợ Stateful Multi-turn bền vững (lưu trữ JSON trên đĩa qua session_id) 
-    và 1-shot (session_id=None). Tận dụng tối đa KV Cache Prefix Matching trên GPU cluster.
-    
-    Args:
-        prompt: Nội dung câu hỏi / lập luận phản biện.
-        session_id: Định danh phiên làm việc để duy trì ngữ cảnh multi-turn (ví dụ: 'adversarial-debate-1').
-        reset_session: Nếu True, xóa sạch ngữ cảnh cũ của session_id và bắt đầu hội thoại mới.
-        thinking: Bật (True) hoặc tắt (False) Thinking Mode. Mặc định: True.
-        effort: Mức độ suy luận CoT ('low', 'high', 'max'). Mặc định: 'high'.
-        system_prompt: Chỉ dẫn hệ thống tĩnh (được đặt ở đầu phiên để tối ưu KV Cache).
-    """
-    client = get_client()
-    cleanup_expired_sessions()
-    
-    default_sys = (
-        "You are an elite software architect and senior code engineer assisting on mission-critical production systems. "
-        "Be precise, rigorous, and truthful."
-    )
-    
-    session = None
-    if session_id:
-        if not reset_session:
-            session = load_session(session_id)
-            
-        if not session:
-            initial_sys = system_prompt or default_sys
-            session = {
-                "session_id": session_id,
-                "messages": [{"role": "system", "content": initial_sys}],
-                "system_prompt": initial_sys,
-                "updated_at": time.time(),
-                "created_at": time.time(),
-                "turn_count": 0
-            }
-        
-        session["messages"].append({"role": "user", "content": prompt})
-        session["updated_at"] = time.time()
-        session["turn_count"] += 1
-        messages = session["messages"]
-        current_turn = session["turn_count"]
-    else:
-        messages = [
-            {"role": "system", "content": system_prompt or default_sys},
-            {"role": "user", "content": prompt}
-        ]
-        current_turn = 1
-        
-    kwargs: Dict[str, Any] = {
-        "model": DEFAULT_MODEL,
-        "messages": messages,
-    }
-    
-    if thinking:
-        valid_effort = effort if effort in ["low", "high", "max"] else "high"
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        kwargs["reasoning_effort"] = valid_effort
-    else:
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        kwargs["reasoning_effort"] = "none"
-        
-    start_time = time.time()
-    try:
-        response = client.chat.completions.create(**kwargs)
-        elapsed = round(time.time() - start_time, 2)
-        
-        msg = response.choices[0].message
-        content = msg.content or ""
-        reasoning = getattr(msg, "reasoning_content", None) or ""
-        telemetry = extract_telemetry(response.usage)
-        telemetry["elapsed_seconds"] = elapsed
-        
-        if session_id and session:
-            session["messages"].append({
-                "role": "assistant",
-                "content": content
-            })
-            session["updated_at"] = time.time()
-            save_session(session_id, session)
-            
-        result = {
-            "session_id": session_id,
-            "turn": current_turn,
-            "model": DEFAULT_MODEL,
-            "mode": "thinking" if thinking else "non-thinking",
-            "effort": effort if thinking else "none",
-            "content": content,
-            "reasoning_content": reasoning if thinking else None,
-            "telemetry": telemetry
-        }
-        if session_id:
-            result["session_active_turns"] = current_turn
-            
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as e:
-        if session_id and session:
-            if session["messages"] and session["messages"][-1]["role"] == "user":
-                session["messages"].pop()
-                session["turn_count"] -= 1
-                save_session(session_id, session)
-        return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
-
-@server.tool()
-def deepseek_session_clear(session_id: Optional[str] = None) -> str:
-    """
-    Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask trên đĩa.
-    
-    Args:
-        session_id: ID của session cần xóa. Nếu None, xóa toàn bộ session trên đĩa.
-    """
-    if session_id:
-        deleted = delete_session(session_id)
-        if deleted:
-            return json.dumps({"status": "SUCCESS", "message": f"Session '{session_id}' đã được xóa khỏi đĩa."}, ensure_ascii=False)
-        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{session_id}' không tồn tại trên đĩa."}, ensure_ascii=False)
-    else:
-        count = delete_all_sessions()
-        return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
-
-
-
-# ---------------------------------------------------------------------------
-# Tool 2: deepseek_adversarial_review (Doubt-Driven Adversarial Code Review)
-# ---------------------------------------------------------------------------
-@server.tool()
-def deepseek_adversarial_review(
-    code_or_diff: str,
-    context_spec: Optional[str] = None,
-    effort: str = "high"
-) -> str:
-    """
-    Thực hiện phản biện gắt (Doubt-Driven Development) trên đoạn code hoặc Git Diff.
-    Persona độc lập có thiên kiến 'Bác bỏ, tìm cách phá hỏng code' để phát hiện edge cases, race conditions, memory leaks, bảo mật.
-    
-    Args:
-        code_or_diff: Nội dung mã nguồn hoặc git diff cần thẩm định.
-        context_spec: Tài liệu đặc tả hoặc yêu cầu của bài toán (nếu có).
-        effort: Mức độ suy luận phản biện ('high' hoặc 'max'). Mặc định: 'high'.
-    """
-    client = get_client()
-    system_prompt = (
-        "You are a ruthless, cynical Principal Security & Reliability Engineer performing an Adversarial Doubt-Driven Review. "
-        "Your explicit bias is to DISPROVE correctness, NOT to approve. "
-        "Actively search for: "
-        "1. Race conditions, deadlocks, lack of thread safety. "
-        "2. Silent failure modes, swallowed exceptions, unhandled None/null. "
-        "3. Boundary off-by-one errors, overflow, memory growth. "
-        "4. Security vulnerabilities (injection, auth bypass, path traversal). "
-        "5. Regression risks in production. "
-        "Format your output strictly: "
-        "- VERDICT: [CLEAN / MINOR_WARNINGS / CRITICAL_DEFECTS] "
-        "- SUMMARY: 2-3 sentences "
-        "- SPECIFIC_VULNERABILITIES_OR_DEFECTS: List with file, line, explanation, and how it breaks."
-    )
-    
-    user_prompt = f"### CONTEXT SPEC:\n{context_spec or 'Not specified'}\n\n### CODE / DIFF TO AUDIT:\n{code_or_diff}"
-    
-    valid_effort = effort if effort in ["high", "max"] else "high"
-    
-    try:
-        response = client.chat.completions.create(
-            model=DEFAULT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            extra_body={"thinking": {"type": "enabled"}},
-            reasoning_effort=valid_effort
-        )
-        msg = response.choices[0].message
-        telemetry = extract_telemetry(response.usage)
-        
-        return json.dumps({
-            "audit_verdict": msg.content,
-            "reasoning_review": getattr(msg, "reasoning_content", None),
-            "telemetry": telemetry
-        }, ensure_ascii=False, indent=2)
-    except Exception as e:
-        return json.dumps({"error": f"Lỗi phản biện: {str(e)}"}, ensure_ascii=False)
-
-# ---------------------------------------------------------------------------
-# Tool 3: deepseek_code_task (ReAct Loop, TDD Runner & Review)
-# ---------------------------------------------------------------------------
-LOCAL_TOOLS_SCHEMA = [
+READ_ONLY_TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Đọc nội dung một file trong workspace",
+            "description": "Đọc nội dung một file trong workspace để điều tra/phân tích mã nguồn",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -400,6 +208,22 @@ LOCAL_TOOLS_SCHEMA = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": "Liệt kê danh sách các file trong workspace để khảo sát cấu trúc dự án",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sub_dir": {"type": "string", "description": "Thư mục con cần xem (để trống nếu xem từ root workspace)"}
+                }
+            }
+        }
+    }
+]
+
+LOCAL_TOOLS_SCHEMA = READ_ONLY_TOOLS_SCHEMA + [
     {
         "type": "function",
         "function": {
@@ -444,21 +268,28 @@ LOCAL_TOOLS_SCHEMA = [
                 "required": ["command"]
             }
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_files",
-            "description": "Liệt kê danh sách các file trong một thư mục của workspace",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sub_dir": {"type": "string", "description": "Thư mục con (để trống nếu muốn xem root)"}
-                }
-            }
-        }
     }
 ]
+
+def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
+    """Chuyển đổi assistant message thành dictionary tương thích JSON và DeepSeek API."""
+    d: Dict[str, Any] = {
+        "role": "assistant",
+        "content": msg.content or ""
+    }
+    reasoning = getattr(msg, "reasoning_content", None)
+    if reasoning:
+        d["reasoning_content"] = reasoning
+    if getattr(msg, "tool_calls", None):
+        d["tool_calls"] = [{
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.function.name,
+                "arguments": tc.function.arguments
+            }
+        } for tc in msg.tool_calls]
+    return d
 
 def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
     """Thực thi tool local với chốt chặn an toàn Sandbox."""
@@ -548,7 +379,6 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         try:
             files_list = []
             for root, dirs, files in os.walk(full_path):
-                # Ignore .git, __pycache__, node_modules
                 dirs[:] = [d for d in dirs if d not in [".git", "__pycache__", "node_modules", "venv", ".venv"]]
                 for file in files:
                     rel = os.path.relpath(os.path.join(root, file), workspace)
@@ -563,6 +393,298 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
 
     return f"Unknown tool: {name}"
 
+# ---------------------------------------------------------------------------
+# Tool 1: deepseek_ask (Trực tiếp suy luận hoặc truy vấn DeepSeek Flash)
+# ---------------------------------------------------------------------------
+@server.tool()
+def deepseek_ask(
+    prompt: str,
+    session_id: Optional[str] = None,
+    reset_session: bool = False,
+    workspace_dir: Optional[str] = None,
+    max_tool_turns: int = 5,
+    thinking: bool = True,
+    effort: str = "high",
+    system_prompt: Optional[str] = None
+) -> str:
+    """
+    Truy vấn DeepSeek-Flash, hỗ trợ:
+    1. Stateful Multi-turn bền vững (lưu trữ JSON trên đĩa qua session_id).
+    2. Chế độ điều tra tự động (Autonomous Investigation): Nếu truyền workspace_dir, DeepSeek được cấp tool READ-ONLY
+       (read_file, list_files) để tự đi đọc file và khảo sát codebase mà không cần Antigravity mớm code thủ công.
+    3. Tận dụng tối đa KV Cache Prefix Matching trên GPU cluster.
+    
+    Args:
+        prompt: Nội dung câu hỏi / lập luận phản biện / yêu cầu điều tra codebase.
+        session_id: Định danh phiên làm việc để duy trì ngữ cảnh multi-turn (ví dụ: Conversation ID).
+        reset_session: Nếu True, xóa sạch ngữ cảnh cũ của session_id và bắt đầu hội thoại mới.
+        workspace_dir: Đường dẫn thư mục dự án cần điều tra (bật tính năng read-only tool calls).
+        max_tool_turns: Số lượt đọc file tối đa trong chế độ điều tra (mặc định: 5).
+        thinking: Bật (True) hoặc tắt (False) Thinking Mode. Mặc định: True.
+        effort: Mức độ suy luận CoT ('low', 'high', 'max'). Mặc định: 'high'.
+        system_prompt: Chỉ dẫn hệ thống tĩnh (được đặt ở đầu phiên để tối ưu KV Cache).
+    """
+    client = get_client()
+    cleanup_expired_sessions()
+    
+    workspace = None
+    if workspace_dir:
+        workspace = os.path.realpath(workspace_dir)
+        if not os.path.isdir(workspace):
+            return json.dumps({"error": f"Workspace '{workspace_dir}' không tồn tại!"}, ensure_ascii=False)
+            
+    default_sys = (
+        "You are an elite software architect and senior code engineer assisting on mission-critical production systems. "
+        "Be precise, rigorous, and truthful."
+    )
+    if workspace:
+        default_sys += (
+            " You have access to local read-only tools: 'read_file' and 'list_files'. "
+            "Use them autonomously to inspect files in the workspace whenever you need code context before providing your verdict."
+        )
+    
+    session = None
+    turn_start_msg_count = 0
+    if session_id:
+        if not reset_session:
+            session = load_session(session_id)
+            
+        if not session:
+            initial_sys = system_prompt or default_sys
+            session = {
+                "session_id": session_id,
+                "messages": [{"role": "system", "content": initial_sys}],
+                "system_prompt": initial_sys,
+                "updated_at": time.time(),
+                "created_at": time.time(),
+                "turn_count": 0
+            }
+        
+        turn_start_msg_count = len(session["messages"])
+        session["messages"].append({"role": "user", "content": prompt})
+        session["updated_at"] = time.time()
+        session["turn_count"] += 1
+        messages = session["messages"]
+        current_turn = session["turn_count"]
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt or default_sys},
+            {"role": "user", "content": prompt}
+        ]
+        current_turn = 1
+        
+    kwargs: Dict[str, Any] = {
+        "model": DEFAULT_MODEL,
+        "messages": messages,
+    }
+    
+    if thinking:
+        valid_effort = effort if effort in ["low", "high", "max"] else "high"
+        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        kwargs["reasoning_effort"] = valid_effort
+    else:
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        kwargs["reasoning_effort"] = "none"
+        
+    start_time = time.time()
+    tools_used: List[Dict[str, Any]] = []
+    tool_turns_executed = 0
+    all_telemetry: List[Dict[str, Any]] = []
+    final_content = ""
+    final_reasoning = ""
+    
+    try:
+        if workspace:
+            kwargs["tools"] = READ_ONLY_TOOLS_SCHEMA
+            for _ in range(max_tool_turns):
+                tool_turns_executed += 1
+                response = client.chat.completions.create(**kwargs)
+                msg = response.choices[0].message
+                all_telemetry.append(extract_telemetry(response.usage))
+                messages.append(serialize_assistant_message(msg))
+                
+                if not getattr(msg, "tool_calls", None):
+                    final_content = msg.content or ""
+                    final_reasoning = getattr(msg, "reasoning_content", None) or ""
+                    break
+                    
+                for tc in msg.tool_calls:
+                    fn_name = tc.function.name
+                    try:
+                        fn_args = json.loads(tc.function.arguments)
+                    except Exception:
+                        fn_args = {}
+                    if fn_name in ["read_file", "list_files"]:
+                        tool_out = execute_local_tool(workspace, fn_name, fn_args)
+                        tools_used.append({"tool": fn_name, "args": fn_args})
+                    else:
+                        tool_out = f"Error: Tool '{fn_name}' không được phép trong chế độ read-only!"
+                        
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": str(tool_out)
+                    })
+                    
+            if not final_content:
+                messages.append({
+                    "role": "user",
+                    "content": "Synthesize your final answer now based on the information read."
+                })
+                kwargs_final = {
+                    "model": DEFAULT_MODEL,
+                    "messages": messages,
+                    "extra_body": kwargs.get("extra_body", {}),
+                    "reasoning_effort": kwargs.get("reasoning_effort", "none")
+                }
+                res_final = client.chat.completions.create(**kwargs_final)
+                msg_final = res_final.choices[0].message
+                final_content = msg_final.content or ""
+                final_reasoning = getattr(msg_final, "reasoning_content", None) or ""
+                messages.append(serialize_assistant_message(msg_final))
+                all_telemetry.append(extract_telemetry(res_final.usage))
+                
+            elapsed = round(time.time() - start_time, 2)
+            
+            total_prompt = sum(t.get("prompt_tokens", 0) for t in all_telemetry)
+            total_completion = sum(t.get("completion_tokens", 0) for t in all_telemetry)
+            total_hit = sum(t.get("prompt_cache_hit_tokens", 0) for t in all_telemetry)
+            total_miss = sum(t.get("prompt_cache_miss_tokens", 0) for t in all_telemetry)
+            total_reasoning = sum(t.get("reasoning_tokens", 0) for t in all_telemetry)
+            
+            telemetry = {
+                "prompt_tokens": total_prompt,
+                "prompt_cache_hit_tokens": total_hit,
+                "prompt_cache_miss_tokens": total_miss,
+                "cache_hit_rate_pct": round((total_hit / total_prompt * 100), 2) if total_prompt > 0 else 0.0,
+                "completion_tokens": total_completion,
+                "reasoning_tokens": total_reasoning,
+                "total_tokens": total_prompt + total_completion,
+                "elapsed_seconds": elapsed,
+                "turns_count": tool_turns_executed
+            }
+        else:
+            response = client.chat.completions.create(**kwargs)
+            elapsed = round(time.time() - start_time, 2)
+            
+            msg = response.choices[0].message
+            final_content = msg.content or ""
+            final_reasoning = getattr(msg, "reasoning_content", None) or ""
+            telemetry = extract_telemetry(response.usage)
+            telemetry["elapsed_seconds"] = elapsed
+            messages.append(serialize_assistant_message(msg))
+            
+        if session_id and session:
+            session["messages"] = messages
+            session["updated_at"] = time.time()
+            save_session(session_id, session)
+            
+        result = {
+            "session_id": session_id,
+            "turn": current_turn,
+            "model": DEFAULT_MODEL,
+            "mode": "thinking" if thinking else "non-thinking",
+            "effort": effort if thinking else "none",
+            "workspace_dir": workspace,
+            "investigation_tool_turns": tool_turns_executed if workspace else 0,
+            "tools_used": tools_used if workspace else [],
+            "content": final_content,
+            "reasoning_content": final_reasoning if thinking else None,
+            "telemetry": telemetry
+        }
+        if session_id:
+            result["session_active_turns"] = current_turn
+            
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as e:
+        if session_id and session:
+            session["messages"] = session["messages"][:turn_start_msg_count]
+            session["turn_count"] -= 1
+            save_session(session_id, session)
+        return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
+
+
+@server.tool()
+def deepseek_session_clear(session_id: Optional[str] = None) -> str:
+    """
+    Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask trên đĩa.
+    
+    Args:
+        session_id: ID của session cần xóa. Nếu None, xóa toàn bộ session trên đĩa.
+    """
+    if session_id:
+        deleted = delete_session(session_id)
+        if deleted:
+            return json.dumps({"status": "SUCCESS", "message": f"Session '{session_id}' đã được xóa khỏi đĩa."}, ensure_ascii=False)
+        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{session_id}' không tồn tại trên đĩa."}, ensure_ascii=False)
+    else:
+        count = delete_all_sessions()
+        return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
+
+
+
+# ---------------------------------------------------------------------------
+# Tool 2: deepseek_adversarial_review (Doubt-Driven Adversarial Code Review)
+# ---------------------------------------------------------------------------
+@server.tool()
+def deepseek_adversarial_review(
+    code_or_diff: str,
+    context_spec: Optional[str] = None,
+    effort: str = "high"
+) -> str:
+    """
+    Thực hiện phản biện gắt (Doubt-Driven Development) trên đoạn code hoặc Git Diff.
+    Persona độc lập có thiên kiến 'Bác bỏ, tìm cách phá hỏng code' để phát hiện edge cases, race conditions, memory leaks, bảo mật.
+    
+    Args:
+        code_or_diff: Nội dung mã nguồn hoặc git diff cần thẩm định.
+        context_spec: Tài liệu đặc tả hoặc yêu cầu của bài toán (nếu có).
+        effort: Mức độ suy luận phản biện ('high' hoặc 'max'). Mặc định: 'high'.
+    """
+    client = get_client()
+    system_prompt = (
+        "You are a ruthless, cynical Principal Security & Reliability Engineer performing an Adversarial Doubt-Driven Review. "
+        "Your explicit bias is to DISPROVE correctness, NOT to approve. "
+        "Actively search for: "
+        "1. Race conditions, deadlocks, lack of thread safety. "
+        "2. Silent failure modes, swallowed exceptions, unhandled None/null. "
+        "3. Boundary off-by-one errors, overflow, memory growth. "
+        "4. Security vulnerabilities (injection, auth bypass, path traversal). "
+        "5. Regression risks in production. "
+        "Format your output strictly: "
+        "- VERDICT: [CLEAN / MINOR_WARNINGS / CRITICAL_DEFECTS] "
+        "- SUMMARY: 2-3 sentences "
+        "- SPECIFIC_VULNERABILITIES_OR_DEFECTS: List with file, line, explanation, and how it breaks."
+    )
+    
+    user_prompt = f"### CONTEXT SPEC:\n{context_spec or 'Not specified'}\n\n### CODE / DIFF TO AUDIT:\n{code_or_diff}"
+    
+    valid_effort = effort if effort in ["high", "max"] else "high"
+    
+    try:
+        response = client.chat.completions.create(
+            model=DEFAULT_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            extra_body={"thinking": {"type": "enabled"}},
+            reasoning_effort=valid_effort
+        )
+        msg = response.choices[0].message
+        telemetry = extract_telemetry(response.usage)
+        
+        return json.dumps({
+            "audit_verdict": msg.content,
+            "reasoning_review": getattr(msg, "reasoning_content", None),
+            "telemetry": telemetry
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return json.dumps({"error": f"Lỗi phản biện: {str(e)}"}, ensure_ascii=False)
+
+# ---------------------------------------------------------------------------
+# Tool 3: deepseek_code_task (ReAct Loop, TDD Runner & Review)
+# ---------------------------------------------------------------------------
 @server.tool()
 def deepseek_code_task(
     workspace_dir: str,
