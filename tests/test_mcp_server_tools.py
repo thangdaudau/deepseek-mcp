@@ -103,55 +103,6 @@ def test_ask_session_lifecycle():
     assert load_session("s1") is None
     assert load_session("s2") is None
 
-def test_parse_dsml_tool_calls():
-    from server import parse_dsml_tool_calls
-    import json
-    
-    # 1. Double fullwidth pipe with calls wrapper and preamble text
-    raw_1 = (
-        "I will explore the workspace to inspect files.\n\n"
-        "<｜｜DSML｜｜ calls>\n"
-        "<｜｜DSML｜｜ invoke name=\"list_files\">\n"
-        "<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">.</｜｜DSML｜｜ parameter>\n"
-        "</｜｜DSML｜｜ invoke>\n"
-        "</｜｜DSML｜｜ calls>"
-    )
-    calls_1, clean_1 = parse_dsml_tool_calls(raw_1)
-    assert len(calls_1) == 1
-    assert calls_1[0].function.name == "list_files"
-    args_1 = json.loads(calls_1[0].function.arguments)
-    assert args_1 == {"path": "."}
-    assert "<｜｜DSML｜｜" not in clean_1
-    assert "I will explore the workspace" in clean_1
-    
-    # 2. Single pipe, alias list_directory -> list_files, boolean string=false
-    raw_2 = (
-        "<｜DSML｜invoke name=\"list_directory\">\n"
-        "<｜DSML｜parameter name=\"path\" string=\"true\">tests</｜DSML｜parameter>\n"
-        "<｜DSML｜parameter name=\"recursive\" string=\"false\">true</｜DSML｜parameter>\n"
-        "</｜DSML｜invoke>"
-    )
-    calls_2, clean_2 = parse_dsml_tool_calls(raw_2)
-    assert len(calls_2) == 1
-    assert calls_2[0].function.name == "list_files" # alias mapped
-    args_2 = json.loads(calls_2[0].function.arguments)
-    assert args_2["path"] == "tests"
-    assert args_2["recursive"] is True
-    assert clean_2 == ""
-    
-    # 3. Read file with path
-    raw_3 = (
-        "<|DSML|calls>\n"
-        "<|DSML|invoke name=\"read_file\">\n"
-        "<|DSML|parameter name=\"path\" string=\"true\">server.py</|DSML|parameter>\n"
-        "</|DSML|invoke>\n"
-        "</|DSML|calls>"
-    )
-    calls_3, clean_3 = parse_dsml_tool_calls(raw_3)
-    assert len(calls_3) == 1
-    assert calls_3[0].function.name == "read_file"
-    assert json.loads(calls_3[0].function.arguments)["path"] == "server.py"
-
 def test_list_files_schema_and_execution_alias():
     from server import READ_ONLY_TOOLS_SCHEMA, execute_local_tool
     import json

@@ -281,73 +281,6 @@ TOOL_SYSTEM_DIRECTIVE = (
     "4. SYNTHESIS: Provide your comprehensive analysis or verdict only after all necessary tools have returned their results."
 )
 
-class ParsedToolCall:
-    def __init__(self, call_id: str, name: str, arguments: Dict[str, Any]):
-        self.id = call_id
-        self.type = "function"
-        self.function = type("Function", (), {
-            "name": name,
-            "arguments": json.dumps(arguments, ensure_ascii=False)
-        })()
-
-def parse_dsml_tool_calls(content: str) -> Tuple[List[Any], str]:
-    """
-    Bóc tách các tool calls định dạng DSML nếu model xả thẳng ra text trong content.
-    Hỗ trợ cả ký tự đơn ｜, kép ｜｜ và ascii |.
-    Trả về (list các tool_call objects tương thích OpenAI, cleaned_content).
-    """
-    if not content or "DSML" not in content:
-        return [], content
-
-    tool_calls = []
-    invoke_pattern = re.compile(
-        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke\s+name=[\"']([^\"']+)[\"']>(.*?)</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke>",
-        re.DOTALL
-    )
-    param_pattern = re.compile(
-        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter\s+name=[\"']([^\"']+)[\"'](?:\s+string=[\"'](true|false)[\"'])?>(.*?)</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*parameter>",
-        re.DOTALL
-    )
-
-    clean_content = content
-    for idx, match in enumerate(invoke_pattern.finditer(content)):
-        fn_name = match.group(1).strip()
-        body = match.group(2)
-        args = {}
-        for p_match in param_pattern.finditer(body):
-            p_name = p_match.group(1).strip()
-            is_str = p_match.group(2) != "false"
-            val = p_match.group(3).strip()
-            if not is_str:
-                try:
-                    val = json.loads(val)
-                except Exception:
-                    pass
-            args[p_name] = val
-        
-        # Hỗ trợ alias phổ biến
-        if fn_name == "list_directory":
-            fn_name = "list_files"
-            
-        call_id = f"call_dsml_{int(time.time())}_{idx}"
-        tool_calls.append(ParsedToolCall(call_id, fn_name, args))
-
-    # Xóa sạch toàn bộ block DSML khỏi content để không làm rác ngữ cảnh
-    clean_content = re.sub(
-        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:calls|tool_calls)>.*?</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*(?:calls|tool_calls)>",
-        "",
-        clean_content,
-        flags=re.DOTALL
-    )
-    clean_content = re.sub(
-        r"<[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke.*?</[｜|]{1,2}\s*DSML\s*[｜|]{1,2}\s*invoke>",
-        "",
-        clean_content,
-        flags=re.DOTALL
-    ).strip()
-
-    return tool_calls, clean_content
-
 def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
     """Chuyển đổi assistant message thành dictionary tương thích JSON và DeepSeek API."""
     d: Dict[str, Any] = {
@@ -586,25 +519,14 @@ def deepseek_ask(
                 msg = response.choices[0].message
                 all_telemetry.append(extract_telemetry(response.usage))
                 
-                tool_calls = getattr(msg, "tool_calls", None)
-                if not tool_calls and msg.content and "DSML" in msg.content:
-                    parsed_calls, clean_text = parse_dsml_tool_calls(msg.content)
-                    if parsed_calls:
-                        tool_calls = parsed_calls
-                        msg.content = clean_text
-                        try:
-                            msg.tool_calls = parsed_calls
-                        except Exception:
-                            pass
-                
                 messages.append(serialize_assistant_message(msg))
                 
-                if not tool_calls:
+                if not getattr(msg, "tool_calls", None):
                     final_content = msg.content or ""
                     final_reasoning = getattr(msg, "reasoning_content", None) or ""
                     break
                     
-                for tc in tool_calls:
+                for tc in msg.tool_calls:
                     fn_name = tc.function.name
                     try:
                         fn_args = json.loads(tc.function.arguments)
@@ -895,18 +817,7 @@ def deepseek_code_task(
         messages.append(msg)
         loop_telemetry.append(extract_telemetry(res.usage))
 
-        tool_calls = getattr(msg, "tool_calls", None)
-        if not tool_calls and msg.content and "DSML" in msg.content:
-            parsed_calls, clean_text = parse_dsml_tool_calls(msg.content)
-            if parsed_calls:
-                tool_calls = parsed_calls
-                msg.content = clean_text
-                try:
-                    msg.tool_calls = parsed_calls
-                except Exception:
-                    pass
-
-        if not tool_calls:
+        if not msg.tool_calls:
             # Model declares completion or gives text
             if test_cmd:
                 test_exec = subprocess.run(test_cmd, shell=True, cwd=workspace, capture_output=True, text=True, timeout=90, env=exec_env)
@@ -924,7 +835,7 @@ def deepseek_code_task(
                 test_passed = True
                 break
 
-        for tool_call in tool_calls:
+        for tool_call in msg.tool_calls:
             fn_name = tool_call.function.name
             try:
                 fn_args = json.loads(tool_call.function.arguments)
