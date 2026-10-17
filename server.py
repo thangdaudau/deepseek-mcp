@@ -608,7 +608,7 @@ LOCAL_TOOLS_SCHEMA = READ_ONLY_TOOLS_SCHEMA + [
         "type": "function",
         "function": {
             "name": "edit_file_replace",
-            "description": "Thay thế chính xác một khối text trong file bằng nội dung mới",
+            "description": "Thay thế chính xác một khối text trong file bằng nội dung mới. Để chèn (insert) vào trước/sau một đoạn mã mà không xóa mã cũ, hãy giữ lại search_block trong replace_block (ví dụ chèn sau: replace_block = search_block + '\\n<mã mới>').",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -647,7 +647,8 @@ TOOL_SYSTEM_DIRECTIVE = (
     "5. PAGINATION PROTOCOL: If 'read_file' returns 'truncated': true, invoke 'read_file' again with 'start_line'=next_start_line "
     "to read subsequent content. Never guess or hallucinate missing file lines.\n"
     "6. LINE NUMBERS PROTOCOL: 'read_file' prefixes each line with '<line_number>: ' for exact navigation. "
-    "When applying edits via 'edit_file_replace', you MUST STRIP these line number prefixes from 'search_block' and 'replace_block'."
+    "When applying edits via 'edit_file_replace', you MUST STRIP these line number prefixes from 'search_block' and 'replace_block'. "
+    "To insert code before/after existing code, preserve the anchor search_block in your replace_block."
 )
 
 def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
