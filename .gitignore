@@ -2,6 +2,7 @@
 .env
 *.env
 *.key
+sessions/
 
 # Python Virtual Environments
 venv/

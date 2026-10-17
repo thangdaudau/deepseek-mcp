@@ -10,6 +10,11 @@ import sys
 import json
 import re
 import time
+import stat
+import fcntl
+import signal
+import threading
+import functools
 import subprocess
 import hashlib
 import tempfile
@@ -26,6 +31,13 @@ from pydantic import BaseModel, Field
 DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
+MAX_READ_BYTES = 256 * 1024       # 256KB hard cap per read
+MAX_READ_LINES = 2000             # 2000 lines max per read
+CHUNK_SIZE = 64 * 1024            # 64KB chunk streaming
+MAX_TOOL_RESULT = 32_000          # 32,000 chars per-tool-call cap in messages
+MAX_SESSION_BYTES = 8 * 1024 * 1024 # 8MB max session JSON on disk
+MAX_SHELL_OUT = 128 * 1024        # 128KB output cap for shell commands
+
 DANGEROUS_COMMAND_PATTERNS = [
     r"\brm\s+.*(-[a-zA-Z0-9]*[rfRF]|--recursive|--force).*\s+(/|~|\$HOME|\*)(\s|$)",
     r"\bmkfs(\.[a-z0-9]+)?(\s|$)",
@@ -40,6 +52,34 @@ DANGEROUS_COMMAND_PATTERNS = [
 ]
 
 server = MCPServer("DeepSeek-MCP")
+
+class SessionBusyError(Exception):
+    """Ném ra khi session file đang bị khóa bởi một tiến trình / turn khác."""
+    pass
+
+def tool_guard(fn):
+    """Decorator bảo đảm 100% các tool của MCPServer luôn trả về chuỗi JSON hợp lệ, không ném exception thô ra stdio."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except SessionBusyError as e:
+            return json.dumps({
+                "status": "ERROR",
+                "error": {
+                    "code": "E_SESSION_BUSY",
+                    "message": str(e)
+                }
+            }, ensure_ascii=False)
+        except Exception as e:
+            return json.dumps({
+                "status": "ERROR",
+                "error": {
+                    "code": "E_INTERNAL",
+                    "message": f"{type(e).__name__}: {str(e)}"
+                }
+            }, ensure_ascii=False)
+    return wrapper
 
 def get_api_key() -> str:
     # 1. Direct env var
@@ -69,8 +109,24 @@ def get_client() -> OpenAI:
         raise ValueError("Lỗi: Chưa tìm thấy DEEPSEEK_API_KEY trong env hoặc ~/.local/share/deepseek-mcp/.env!")
     return OpenAI(api_key=api_key, base_url=DEFAULT_BASE_URL, timeout=120.0, max_retries=2)
 
+SENSITIVE_ENV_KEYWORDS = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH")
+
+def build_scrubbed_env() -> Dict[str, str]:
+    """Tẩy sạch các biến môi trường chứa secret trực tiếp khỏi env của child process nhưng giữ nguyên HOME và toolchain."""
+    scrubbed = {
+        k: v for k, v in os.environ.items()
+        if not any(kw in k.upper() for kw in SENSITIVE_ENV_KEYWORDS)
+    }
+    venv_bin = os.path.dirname(sys.executable)
+    scrubbed["PATH"] = f"{venv_bin}{os.pathsep}{scrubbed.get('PATH', '')}"
+    return scrubbed
+
 def is_safe_path(base_dir: str, target_path: str) -> Tuple[bool, str]:
-    """Kiểm tra chặn Path Traversal ra ngoài workspace và denylist các đường dẫn nhạy cảm."""
+    """
+    Kiểm tra chặn Path Traversal ra ngoài workspace và denylist các đường dẫn nhạy cảm.
+    Bộ lọc chống phá hoại vô tình (accidental footguns), chuẩn hóa lowercase trên dir parts
+    để tương thích an toàn trên macOS (APFS) và Windows (NTFS).
+    """
     base = os.path.realpath(base_dir)
     target = os.path.realpath(os.path.join(base, target_path))
     if not (target == base or target.startswith(base + os.sep)):
@@ -80,7 +136,7 @@ def is_safe_path(base_dir: str, target_path: str) -> Tuple[bool, str]:
     parts = Path(rel).parts
 
     # Chặn truy cập .git (chống RCE qua hooks/config) và .venv (chống can thiệp virtualenv binary)
-    if any(p in (".git", ".venv") for p in parts):
+    if any(p.lower() in (".git", ".venv") for p in parts):
         return False, target
 
     filename = parts[-1].lower() if parts else ""
@@ -95,7 +151,10 @@ def is_safe_path(base_dir: str, target_path: str) -> Tuple[bool, str]:
     return True, target
 
 def check_command_safety(command: str) -> Tuple[bool, Optional[str]]:
-    """Kiểm tra lệnh nguy hiểm trong blacklist."""
+    """
+    Bộ lọc FOOTGUN chống phá bậy vô tình (rm -rf /, mkfs, git push -f).
+    Dùng để bảo vệ môi trường dev của user khỏi các lệnh tự sát.
+    """
     for pattern in DANGEROUS_COMMAND_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
             return False, f"Lệnh bị chặn bởi Guardrail an toàn (trùng khớp pattern nguy hiểm: {pattern})"
@@ -131,7 +190,6 @@ def extract_telemetry(response_usage: Any) -> Dict[str, Any]:
     }
 
 # ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Session Manager for Stateful Multi-Turn Conversations (File-based Persistence)
 # ---------------------------------------------------------------------------
 SESSIONS_DIR = os.path.expanduser("~/.local/share/deepseek-mcp/sessions")
@@ -143,6 +201,59 @@ def get_session_file(session_id: str) -> str:
     safe_prefix = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)[:32]
     id_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
     return os.path.join(SESSIONS_DIR, f"{safe_prefix}_{id_hash}.json")
+
+def session_lock(session_id: str):
+    """Context manager khóa file session bằng fcntl.flock (LOCK_EX | LOCK_NB). Fail-fast nếu đang bận."""
+    class _LockContext:
+        def __init__(self, sid: str):
+            self.sid = sid
+            self.fh = None
+
+        def __enter__(self):
+            lock_file = get_session_file(self.sid) + ".lock"
+            self.fh = open(lock_file, "a+")
+            try:
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except (BlockingIOError, IOError):
+                self.fh.close()
+                self.fh = None
+                raise SessionBusyError(f"Session '{self.sid}' đang được xử lý bởi một tiến trình khác.")
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.fh:
+                try:
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                self.fh.close()
+                self.fh = None
+
+    return _LockContext(session_id)
+
+def _normalize_session(session_id: str, data: Optional[Dict[str, Any]], system_prompt: str) -> Dict[str, Any]:
+    """Đảm bảo cấu trúc session luôn hợp lệ và đầy đủ các trường, loại bỏ hoàn toàn nguy cơ KeyError."""
+    if not isinstance(data, dict):
+        data = {}
+    msgs = data.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        msgs = [{"role": "system", "content": system_prompt}]
+    
+    turn_count = data.get("turn_count", 0)
+    try:
+        turn_count = int(turn_count)
+    except (ValueError, TypeError):
+        turn_count = 0
+
+    return {
+        "session_id": session_id,
+        "messages": msgs,
+        "system_prompt": data.get("system_prompt") or system_prompt,
+        "turn_count": turn_count,
+        "created_at": data.get("created_at") or time.time(),
+        "updated_at": time.time(),
+        "schema_version": 2
+    }
 
 def load_session(session_id: str) -> Optional[Dict[str, Any]]:
     """Tải session từ đĩa, tự hủy nếu quá hạn TTL."""
@@ -163,15 +274,19 @@ def save_session(session_id: str, data: Dict[str, Any]) -> None:
     """Ghi bền vững và nguyên tử (atomic write) session xuống file JSON trên đĩa."""
     file_path = get_session_file(session_id)
     dir_name = os.path.dirname(file_path)
+    os.makedirs(dir_name, exist_ok=True)
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            temp_path = tf.name   # Gán NGAY trước khi dump, chống leak file nếu dump fail
             json.dump(data, tf, ensure_ascii=False, indent=2)
             tf.flush()
             os.fsync(tf.fileno())
-            temp_path = tf.name
         os.replace(temp_path, file_path)
-    except Exception:
+        temp_path = None
+    except Exception as e:
+        sys.stderr.write(f"Error saving session {session_id}: {str(e)}\n")
+    finally:
         if temp_path and os.path.exists(temp_path):
             try:
                 os.remove(temp_path)
@@ -181,13 +296,20 @@ def save_session(session_id: str, data: Dict[str, Any]) -> None:
 def delete_session(session_id: str) -> bool:
     """Xóa file session chỉ định trên đĩa."""
     file_path = get_session_file(session_id)
+    lock_file = file_path + ".lock"
+    deleted = False
     if os.path.exists(file_path):
         try:
             os.remove(file_path)
-            return True
+            deleted = True
         except Exception:
             pass
-    return False
+    if os.path.exists(lock_file):
+        try:
+            os.remove(lock_file)
+        except Exception:
+            pass
+    return deleted
 
 def delete_all_sessions() -> int:
     """Xóa sạch toàn bộ session trên đĩa."""
@@ -195,10 +317,11 @@ def delete_all_sessions() -> int:
         return 0
     count = 0
     for fname in os.listdir(SESSIONS_DIR):
-        if fname.endswith(".json"):
+        if fname.endswith(".json") or fname.endswith(".lock") or fname.startswith("tmp"):
             try:
                 os.remove(os.path.join(SESSIONS_DIR, fname))
-                count += 1
+                if fname.endswith(".json"):
+                    count += 1
             except Exception:
                 pass
     return count
@@ -210,7 +333,7 @@ def cleanup_expired_sessions() -> None:
     now = time.time()
     try:
         for fname in os.listdir(SESSIONS_DIR):
-            if fname.endswith(".json"):
+            if fname.endswith(".json") or fname.endswith(".lock") or fname.startswith("tmp"):
                 fpath = os.path.join(SESSIONS_DIR, fname)
                 try:
                     if now - os.path.getmtime(fpath) > SESSION_TTL_SECONDS:
@@ -228,11 +351,13 @@ READ_ONLY_TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Đọc nội dung một file trong workspace để điều tra/phân tích mã nguồn",
+            "description": "Đọc nội dung file trong workspace (hỗ trợ phân trang an toàn). Trả về JSON envelope gồm content và thông tin phân trang.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Đường dẫn file tương đối trong workspace"}
+                    "path": {"type": "string", "description": "Đường dẫn file tương đối trong workspace"},
+                    "start_line": {"type": "integer", "description": "Dòng bắt đầu đọc (1-indexed, mặc định: 1)"},
+                    "line_count": {"type": "integer", "description": "Số dòng cần đọc tối đa (mặc định: đọc tối đa 2000 dòng hoặc tới 256KB)"}
                 },
                 "required": ["path"]
             }
@@ -305,10 +430,12 @@ TOOL_SYSTEM_DIRECTIVE = (
     "\n\n[CRITICAL TOOL PROTOCOL & EXECUTION RULES]\n"
     "1. ZERO-PREAMBLE CONSTRAINT: When you need to inspect files, you MUST invoke the tool immediately. "
     "NEVER output conversational filler, introductory remarks, or preamble text before a tool call.\n"
-    "2. STRICT SCHEMA ADHERENCE: Use ONLY the exact tool names ('read_file', 'list_files') and exact parameter keys ('path') "
+    "2. STRICT SCHEMA ADHERENCE: Use ONLY the exact tool names ('read_file', 'list_files') and exact parameter keys "
     "defined in the schema. Do not invent aliases or extra parameters.\n"
     "3. NO RAW MARKUP: Rely strictly on native tool calls. Never emit raw DSML or XML tags into conversation text.\n"
-    "4. SYNTHESIS: Provide your comprehensive analysis or verdict only after all necessary tools have returned their results."
+    "4. SYNTHESIS: Provide your comprehensive analysis or verdict only after all necessary tools have returned their results.\n"
+    "5. PAGINATION PROTOCOL: If 'read_file' returns 'truncated': true, invoke 'read_file' again with 'start_line'=next_start_line "
+    "to read subsequent content. Never guess or hallucinate missing file lines."
 )
 
 def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
@@ -332,22 +459,199 @@ def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
         } for i, tc in enumerate(tool_calls)]
     return d
 
+def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX_SHELL_OUT) -> Tuple[str, int, str]:
+    """
+    Thực thi shell command với process group riêng biệt, streaming output có trần và kill tức thời khi chạm trần.
+    Trả về (output_text, exit_code, status_flag) với status_flag in ("ok", "capped", "timeout", "error").
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # Tạo process group riêng để kill toàn bộ cây tiến trình
+        )
+    except Exception as e:
+        return f"Process spawn error: {str(e)}", -1, "error"
+
+    buf = bytearray()
+    state = {"capped": False}
+
+    def drain():
+        try:
+            fd = proc.stdout.fileno()
+            while len(buf) < cap:
+                chunk = os.read(fd, min(64 * 1024, cap - len(buf)))
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            if len(buf) >= cap:
+                state["capped"] = True
+        except (OSError, ValueError):
+            return
+
+    t = threading.Thread(target=drain, daemon=True)
+    t.start()
+
+    deadline = time.monotonic() + timeout
+    flag = "ok"
+
+    while proc.poll() is None:
+        if state["capped"]:
+            flag = "capped"
+            break
+        if time.monotonic() > deadline:
+            flag = "timeout"
+            break
+        time.sleep(0.05)
+
+    if state["capped"]:
+        flag = "capped"
+
+    # Chạm cap hoặc timeout -> Kill cả process group ngay lập tức (không chờ hết 90s)
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+    t.join(timeout=2)
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+
+    text = bytes(buf).decode("utf-8", errors="replace")
+    if flag == "capped":
+        text += f"\n<<OUTPUT TRUNCATED AT {cap} BYTES>>"
+    elif flag == "timeout":
+        text += f"\n<<COMMAND TIMED OUT AFTER {timeout} SECONDS>>"
+
+    rc = proc.returncode if proc.returncode is not None else -9
+    return text, rc, flag
+
+def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line_count: Any = None) -> str:
+    """Đọc file theo chunking nhị phân, chống OOM, chống vỡ tiếng Việt, trả JSON envelope."""
+    safe, full_path = is_safe_path(workspace, rel_path)
+    if not safe:
+        return json.dumps({"status": "ERROR", "code": "E_PATH_DENIED", "message": f"Path '{rel_path}' nằm ngoài workspace!"}, ensure_ascii=False)
+    
+    try:
+        st = os.stat(full_path)
+    except OSError as e:
+        return json.dumps({"status": "ERROR", "code": "E_NOT_FOUND", "message": f"File '{rel_path}' không tồn tại: {str(e)}"}, ensure_ascii=False)
+
+    if not stat.S_ISREG(st.st_mode):
+        return json.dumps({"status": "ERROR", "code": "E_NOT_REGULAR", "message": f"'{rel_path}' không phải regular file (chặn FIFO / device file)."}, ensure_ascii=False)
+
+    def _as_int(v, default):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+
+    start = max(1, _as_int(start_line, 1))
+    want = MAX_READ_LINES if line_count is None else max(1, min(_as_int(line_count, MAX_READ_LINES), MAX_READ_LINES))
+
+    if st.st_size == 0 or start > st.st_size:
+        return json.dumps({
+            "path": rel_path,
+            "start_line": start,
+            "end_line": start - 1,
+            "next_start_line": None,
+            "truncated": False,
+            "eof": True,
+            "file_size": st.st_size,
+            "bytes_returned": 0,
+            "next_step": None,
+            "content": ""
+        }, ensure_ascii=False)
+
+    out = []
+    tail = b""
+    line_no = 0
+    used = 0
+    next_start = None
+    truncated = False
+
+    try:
+        with open(full_path, "rb") as f:
+            head = f.read(8192)
+            if b"\x00" in head:
+                return json.dumps({"status": "ERROR", "code": "E_BINARY", "message": f"'{rel_path}' là file nhị phân, không hỗ trợ xem text."}, ensure_ascii=False)
+            f.seek(0)
+
+            while True:
+                if used >= MAX_READ_BYTES:
+                    truncated = True
+                    break
+                chunk = f.read(min(CHUNK_SIZE, MAX_READ_BYTES - used))
+                if not chunk:
+                    break
+                used += len(chunk)
+                tail += chunk
+
+                parts = tail.split(b"\n")
+                tail = parts.pop()
+
+                stop = False
+                for raw in parts:
+                    line_no += 1
+                    if line_no < start:
+                        continue
+                    if len(out) >= want:
+                        next_start = line_no
+                        truncated = True
+                        stop = True
+                        break
+                    out.append(raw.decode("utf-8", errors="replace") + "\n")
+                if stop:
+                    break
+
+            if not truncated and tail:
+                line_no += 1
+                if line_no >= start:
+                    if len(out) >= want:
+                        next_start = line_no
+                        truncated = True
+                    else:
+                        out.append(tail.decode("utf-8", errors="replace"))
+    except Exception as e:
+        return json.dumps({"status": "ERROR", "code": "E_READ_FAILED", "message": str(e)}, ensure_ascii=False)
+
+    eof = (next_start is None and not truncated)
+    end_line = start + len(out) - 1 if out else start - 1
+    body = "".join(out)
+
+    return json.dumps({
+        "path": rel_path,
+        "start_line": start,
+        "end_line": end_line,
+        "next_start_line": next_start,
+        "truncated": truncated,
+        "eof": eof,
+        "file_size": st.st_size,
+        "bytes_returned": used,
+        "next_step": f"call read_file with start_line={next_start}" if next_start else None,
+        "content": body
+    }, ensure_ascii=False)
+
 def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
     """Thực thi tool local với chốt chặn an toàn Sandbox."""
     if name == "read_file":
         rel_path = args.get("path", "")
-        safe, full_path = is_safe_path(workspace, rel_path)
-        if not safe:
-            return f"Error: Path '{rel_path}' nằm ngoài workspace!"
-        if not os.path.exists(full_path):
-            return f"Error: File '{rel_path}' không tồn tại."
-        if os.path.isfile(full_path) and os.path.getsize(full_path) > 2 * 1024 * 1024:
-            return f"Error: File '{rel_path}' vượt quá giới hạn dung lượng 2MB."
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                return f.read()
-        except Exception as e:
-            return f"Error reading file: {str(e)}"
+        start_line = args.get("start_line", 1)
+        line_count = args.get("line_count", None)
+        return _read_file_envelope(workspace, rel_path, start_line, line_count)
             
     elif name == "write_file":
         rel_path = args.get("path", "")
@@ -392,29 +696,8 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         safe, reason = check_command_safety(cmd)
         if not safe:
             return f"Command Rejected by Safety Guardrail: {reason}"
-        try:
-            sensitive_keywords = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH")
-            scrubbed_env = {
-                k: v for k, v in os.environ.items()
-                if not any(kw in k.upper() for kw in sensitive_keywords)
-            }
-            venv_bin = os.path.dirname(sys.executable)
-            scrubbed_env["PATH"] = f"{venv_bin}:{scrubbed_env.get('PATH', '')}"
-            res = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                timeout=90,
-                env=scrubbed_env
-            )
-            out = res.stdout + ("\n--- STDERR ---\n" + res.stderr if res.stderr else "")
-            return f"Exit code: {res.returncode}\n{out[:4000]}"
-        except subprocess.TimeoutExpired:
-            return "Command timed out after 90 seconds."
-        except Exception as e:
-            return f"Command execution error: {str(e)}"
+        out, rc, flag = _run_capped(cmd, workspace, build_scrubbed_env(), timeout=90)
+        return f"Exit code: {rc}\n{out}"
             
     elif name in ["list_files", "list_directory"]:
         rel_path = args.get("path") or args.get("sub_dir") or ""
@@ -428,13 +711,13 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         try:
             files_list = []
             for root, dirs, files in os.walk(full_path):
-                dirs[:] = [d for d in dirs if d not in [".git", "__pycache__", "node_modules", "venv", ".venv"]]
-                for file in files:
+                dirs[:] = sorted([d for d in dirs if d not in [".git", "__pycache__", "node_modules", "venv", ".venv"]])
+                for file in sorted(files):
                     rel = os.path.relpath(os.path.join(root, file), workspace)
                     files_list.append(rel)
-                    if len(files_list) >= 100:
+                    if len(files_list) >= 200:
                         break
-                if len(files_list) >= 100:
+                if len(files_list) >= 200:
                     break
             files_list.sort()
             return json.dumps(files_list[:100], indent=2)
@@ -447,6 +730,7 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
 # Tool 1: deepseek_ask (Trực tiếp suy luận hoặc truy vấn DeepSeek Flash)
 # ---------------------------------------------------------------------------
 @server.tool()
+@tool_guard
 def deepseek_ask(
     prompt: str,
     session_id: Optional[str] = None,
@@ -459,7 +743,7 @@ def deepseek_ask(
 ) -> str:
     """
     Truy vấn DeepSeek-Flash, hỗ trợ:
-    1. Stateful Multi-turn bền vững (lưu trữ JSON trên đĩa qua session_id).
+    1. Stateful Multi-turn bền vững (lưu trữ JSON trên đĩa qua session_id, có file lock fail-fast).
     2. Chế độ điều tra tự động (Autonomous Investigation): Nếu truyền workspace_dir, DeepSeek được cấp tool READ-ONLY
        (read_file, list_files) để tự đi đọc file và khảo sát codebase mà không cần Antigravity mớm code thủ công.
     3. Tận dụng tối đa KV Cache Prefix Matching trên GPU cluster.
@@ -498,180 +782,192 @@ def deepseek_ask(
     else:
         initial_sys = base_sys
     
-    session = None
-    turn_start_msg_count = 0
-    if session_id:
-        if not reset_session:
-            session = load_session(session_id)
+    def _execute_ask_turn():
+        session = None
+        turn_start_msg_count = 0
+        if session_id:
+            raw_loaded = None
+            if not reset_session:
+                raw_loaded = load_session(session_id)
+            session = _normalize_session(session_id, raw_loaded, initial_sys)
             
-        if not session:
-            session = {
-                "session_id": session_id,
-                "messages": [{"role": "system", "content": initial_sys}],
-                "system_prompt": initial_sys,
-                "updated_at": time.time(),
-                "created_at": time.time(),
-                "turn_count": 0
-            }
+            turn_start_msg_count = len(session["messages"])
+            session["messages"].append({"role": "user", "content": prompt})
+            session["updated_at"] = time.time()
+            session["turn_count"] += 1
+            messages = session["messages"]
+            current_turn = session["turn_count"]
+        else:
+            messages = [
+                {"role": "system", "content": initial_sys},
+                {"role": "user", "content": prompt}
+            ]
+            current_turn = 1
+            
+        kwargs: Dict[str, Any] = {
+            "model": DEFAULT_MODEL,
+            "messages": messages,
+        }
         
-        turn_start_msg_count = len(session["messages"])
-        session["messages"].append({"role": "user", "content": prompt})
-        session["updated_at"] = time.time()
-        session["turn_count"] += 1
-        messages = session["messages"]
-        current_turn = session["turn_count"]
-    else:
-        messages = [
-            {"role": "system", "content": initial_sys},
-            {"role": "user", "content": prompt}
-        ]
-        current_turn = 1
+        if thinking:
+            valid_effort = effort if effort in ["low", "high", "max"] else "high"
+            kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            kwargs["reasoning_effort"] = valid_effort
+        else:
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+            kwargs["reasoning_effort"] = "none"
+            
+        start_time = time.time()
+        tools_used: List[Dict[str, Any]] = []
+        tool_turns_executed = 0
+        all_telemetry: List[Dict[str, Any]] = []
+        final_content = ""
+        final_reasoning = ""
         
-    kwargs: Dict[str, Any] = {
-        "model": DEFAULT_MODEL,
-        "messages": messages,
-    }
-    
-    if thinking:
-        valid_effort = effort if effort in ["low", "high", "max"] else "high"
-        kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-        kwargs["reasoning_effort"] = valid_effort
-    else:
-        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        kwargs["reasoning_effort"] = "none"
-        
-    start_time = time.time()
-    tools_used: List[Dict[str, Any]] = []
-    tool_turns_executed = 0
-    all_telemetry: List[Dict[str, Any]] = []
-    final_content = ""
-    final_reasoning = ""
-    
-    try:
-        if workspace:
-            kwargs["tools"] = READ_ONLY_TOOLS_SCHEMA
-            for _ in range(max_tool_turns):
-                tool_turns_executed += 1
-                response = client.chat.completions.create(**kwargs)
-                msg = response.choices[0].message
-                all_telemetry.append(extract_telemetry(response.usage))
+        try:
+            if workspace:
+                kwargs["tools"] = READ_ONLY_TOOLS_SCHEMA
+                for _ in range(max_tool_turns):
+                    tool_turns_executed += 1
+                    response = client.chat.completions.create(**kwargs)
+                    msg = response.choices[0].message
+                    all_telemetry.append(extract_telemetry(response.usage))
+                    
+                    messages.append(serialize_assistant_message(msg))
+                    
+                    if not getattr(msg, "tool_calls", None):
+                        final_content = msg.content or ""
+                        final_reasoning = getattr(msg, "reasoning_content", None) or ""
+                        break
+                        
+                    for tc in msg.tool_calls:
+                        fn_name = tc.function.name
+                        try:
+                            fn_args = json.loads(tc.function.arguments)
+                        except Exception:
+                            fn_args = {}
+                        if fn_name in ["read_file", "list_files", "list_directory"]:
+                            tool_out = execute_local_tool(workspace, fn_name, fn_args)
+                            tools_used.append({"tool": fn_name, "args": fn_args})
+                        else:
+                            tool_out = f"Error: Tool '{fn_name}' không được phép trong chế độ read-only!"
+                            
+                        # Cap 32.000 ký tự cho từng lệnh gọi tool đơn lẻ (per-tool-call)
+                        str_out = str(tool_out)
+                        if len(str_out) > MAX_TOOL_RESULT:
+                            str_out = str_out[:MAX_TOOL_RESULT] + f"\n<<OUTPUT TRUNCATED AT {MAX_TOOL_RESULT} CHARS>>"
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": str_out
+                        })
+                        
+                if not final_content:
+                    messages.append({
+                        "role": "user",
+                        "content": "Synthesize your final answer now based on the information read."
+                    })
+                    kwargs_final = {
+                        "model": DEFAULT_MODEL,
+                        "messages": messages,
+                        "extra_body": kwargs.get("extra_body", {}),
+                        "reasoning_effort": kwargs.get("reasoning_effort", "none")
+                    }
+                    res_final = client.chat.completions.create(**kwargs_final)
+                    msg_final = res_final.choices[0].message
+                    final_content = msg_final.content or ""
+                    final_reasoning = getattr(msg_final, "reasoning_content", None) or ""
+                    messages.append(serialize_assistant_message(msg_final))
+                    all_telemetry.append(extract_telemetry(res_final.usage))
+                    
+                elapsed = round(time.time() - start_time, 2)
                 
+                total_prompt = sum(t.get("prompt_tokens", 0) for t in all_telemetry)
+                total_completion = sum(t.get("completion_tokens", 0) for t in all_telemetry)
+                total_hit = sum(t.get("prompt_cache_hit_tokens", 0) for t in all_telemetry)
+                total_miss = sum(t.get("prompt_cache_miss_tokens", 0) for t in all_telemetry)
+                total_reasoning = sum(t.get("reasoning_tokens", 0) for t in all_telemetry)
+                
+                telemetry = {
+                    "prompt_tokens": total_prompt,
+                    "prompt_cache_hit_tokens": total_hit,
+                    "prompt_cache_miss_tokens": total_miss,
+                    "cache_hit_rate_pct": round((total_hit / total_prompt * 100), 2) if total_prompt > 0 else 0.0,
+                    "completion_tokens": total_completion,
+                    "reasoning_tokens": total_reasoning,
+                    "total_tokens": total_prompt + total_completion,
+                    "elapsed_seconds": elapsed,
+                    "turns_count": tool_turns_executed
+                }
+            else:
+                response = client.chat.completions.create(**kwargs)
+                elapsed = round(time.time() - start_time, 2)
+                
+                msg = response.choices[0].message
+                final_content = msg.content or ""
+                final_reasoning = getattr(msg, "reasoning_content", None) or ""
+                telemetry = extract_telemetry(response.usage)
+                telemetry["elapsed_seconds"] = elapsed
                 messages.append(serialize_assistant_message(msg))
                 
-                if not getattr(msg, "tool_calls", None):
-                    final_content = msg.content or ""
-                    final_reasoning = getattr(msg, "reasoning_content", None) or ""
-                    break
-                    
-                for tc in msg.tool_calls:
-                    fn_name = tc.function.name
-                    try:
-                        fn_args = json.loads(tc.function.arguments)
-                    except Exception:
-                        fn_args = {}
-                    if fn_name in ["read_file", "list_files", "list_directory"]:
-                        tool_out = execute_local_tool(workspace, fn_name, fn_args)
-                        tools_used.append({"tool": fn_name, "args": fn_args})
-                    else:
-                        tool_out = f"Error: Tool '{fn_name}' không được phép trong chế độ read-only!"
-                        
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": str(tool_out)
-                    })
-                    
-            if not final_content:
-                messages.append({
-                    "role": "user",
-                    "content": "Synthesize your final answer now based on the information read."
-                })
-                kwargs_final = {
-                    "model": DEFAULT_MODEL,
-                    "messages": messages,
-                    "extra_body": kwargs.get("extra_body", {}),
-                    "reasoning_effort": kwargs.get("reasoning_effort", "none")
-                }
-                res_final = client.chat.completions.create(**kwargs_final)
-                msg_final = res_final.choices[0].message
-                final_content = msg_final.content or ""
-                final_reasoning = getattr(msg_final, "reasoning_content", None) or ""
-                messages.append(serialize_assistant_message(msg_final))
-                all_telemetry.append(extract_telemetry(res_final.usage))
+            if session_id and session:
+                session["messages"] = messages
+                session["updated_at"] = time.time()
+                save_session(session_id, session)
                 
-            elapsed = round(time.time() - start_time, 2)
-            
-            total_prompt = sum(t.get("prompt_tokens", 0) for t in all_telemetry)
-            total_completion = sum(t.get("completion_tokens", 0) for t in all_telemetry)
-            total_hit = sum(t.get("prompt_cache_hit_tokens", 0) for t in all_telemetry)
-            total_miss = sum(t.get("prompt_cache_miss_tokens", 0) for t in all_telemetry)
-            total_reasoning = sum(t.get("reasoning_tokens", 0) for t in all_telemetry)
-            
-            telemetry = {
-                "prompt_tokens": total_prompt,
-                "prompt_cache_hit_tokens": total_hit,
-                "prompt_cache_miss_tokens": total_miss,
-                "cache_hit_rate_pct": round((total_hit / total_prompt * 100), 2) if total_prompt > 0 else 0.0,
-                "completion_tokens": total_completion,
-                "reasoning_tokens": total_reasoning,
-                "total_tokens": total_prompt + total_completion,
-                "elapsed_seconds": elapsed,
-                "turns_count": tool_turns_executed
+            result = {
+                "session_id": session_id,
+                "turn": current_turn,
+                "model": DEFAULT_MODEL,
+                "mode": "thinking" if thinking else "non-thinking",
+                "effort": effort if thinking else "none",
+                "workspace_dir": workspace,
+                "investigation_tool_turns": tool_turns_executed if workspace else 0,
+                "tools_used": tools_used if workspace else [],
+                "content": final_content,
+                "reasoning_content": final_reasoning if thinking else None,
+                "telemetry": telemetry
             }
-        else:
-            response = client.chat.completions.create(**kwargs)
-            elapsed = round(time.time() - start_time, 2)
-            
-            msg = response.choices[0].message
-            final_content = msg.content or ""
-            final_reasoning = getattr(msg, "reasoning_content", None) or ""
-            telemetry = extract_telemetry(response.usage)
-            telemetry["elapsed_seconds"] = elapsed
-            messages.append(serialize_assistant_message(msg))
-            
-        if session_id and session:
-            session["messages"] = messages
-            session["updated_at"] = time.time()
-            save_session(session_id, session)
-            
-        result = {
-            "session_id": session_id,
-            "turn": current_turn,
-            "model": DEFAULT_MODEL,
-            "mode": "thinking" if thinking else "non-thinking",
-            "effort": effort if thinking else "none",
-            "workspace_dir": workspace,
-            "investigation_tool_turns": tool_turns_executed if workspace else 0,
-            "tools_used": tools_used if workspace else [],
-            "content": final_content,
-            "reasoning_content": final_reasoning if thinking else None,
-            "telemetry": telemetry
-        }
-        if session_id:
-            result["session_active_turns"] = current_turn
-            
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception as e:
-        if session_id and session:
-            session["messages"] = session["messages"][:turn_start_msg_count]
-            session["turn_count"] -= 1
-            save_session(session_id, session)
-        return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
+            if session_id:
+                result["session_active_turns"] = current_turn
+                
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception as e:
+            if session_id and session:
+                session["messages"] = session["messages"][:turn_start_msg_count]
+                session["turn_count"] -= 1
+                save_session(session_id, session)
+            return json.dumps({"error": f"Lỗi gọi DeepSeek API: {str(e)}"}, ensure_ascii=False)
+
+    if session_id:
+        with session_lock(session_id):
+            return _execute_ask_turn()
+    else:
+        return _execute_ask_turn()
 
 
 @server.tool()
+@tool_guard
 def deepseek_session_clear(session_id: Optional[str] = None) -> str:
     """
     Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask trên đĩa.
     
     Args:
-        session_id: ID của session cần xóa. Nếu None hoặc 'all', xóa toàn bộ session trên đĩa.
+        session_id: ID của session cần xóa. Nếu 'all', xóa toàn bộ session trên đĩa. Không được để trống.
     """
-    if session_id is None or session_id.strip().lower() == "all":
+    if session_id is None or not session_id.strip():
+        return json.dumps({
+            "status": "ERROR",
+            "code": "E_BAD_ARG",
+            "message": "Tham số session_id không được để trống. Để xóa toàn bộ session, truyền session_id='all'."
+        }, ensure_ascii=False)
+
+    sid = session_id.strip()
+    if sid.lower() == "all":
         count = delete_all_sessions()
         return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
     else:
-        sid = session_id.strip()
         deleted = delete_session(sid)
         if deleted:
             return json.dumps({"status": "SUCCESS", "message": f"Session '{sid}' đã được xóa khỏi đĩa."}, ensure_ascii=False)
@@ -683,6 +979,7 @@ def deepseek_session_clear(session_id: Optional[str] = None) -> str:
 # Tool 2: deepseek_adversarial_review (Doubt-Driven Adversarial Code Review)
 # ---------------------------------------------------------------------------
 @server.tool()
+@tool_guard
 def deepseek_adversarial_review(
     code_or_diff: str,
     context_spec: Optional[str] = None,
@@ -714,7 +1011,6 @@ def deepseek_adversarial_review(
     )
     
     user_prompt = f"### CONTEXT SPEC:\n{context_spec or 'Not specified'}\n\n### CODE / DIFF TO AUDIT:\n{code_or_diff}"
-    
     valid_effort = effort if effort in ["high", "max"] else "high"
     
     try:
@@ -742,6 +1038,7 @@ def deepseek_adversarial_review(
 # Tool 3: deepseek_code_task (ReAct Loop, TDD Runner & Review)
 # ---------------------------------------------------------------------------
 @server.tool()
+@tool_guard
 def deepseek_code_task(
     workspace_dir: str,
     task: str,
@@ -770,28 +1067,43 @@ def deepseek_code_task(
     """
     workspace = os.path.realpath(workspace_dir)
     if not os.path.isdir(workspace):
-        return json.dumps({"error": f"Workspace '{workspace_dir}' không tồn tại!"}, ensure_ascii=False)
-        
+        return json.dumps({"status": "ERROR", "error": {"code": "E_NOT_FOUND", "message": f"Workspace '{workspace_dir}' không tồn tại!"}}, ensure_ascii=False)
+
+    if test_cmd:
+        safe_cmd, cmd_reason = check_command_safety(test_cmd)
+        if not safe_cmd:
+            return json.dumps({
+                "status": "ERROR",
+                "error": {
+                    "code": "E_CMD_REJECTED",
+                    "message": f"test_cmd bị chặn bởi Safety Guardrail: {cmd_reason}"
+                }
+            }, ensure_ascii=False)
+
     client = get_client()
     task_id = int(time.time())
     safety_branch = f"deepseek/task-{task_id}"
+    exec_env = build_scrubbed_env()
+    git_errors = []
     
     # 1. Thiết lập Git Safety Net nếu workspace là git repo
     is_git = os.path.exists(os.path.join(workspace, ".git"))
     original_branch = ""
     if is_git:
         try:
-            curr_b = subprocess.run("git rev-parse --abbrev-ref HEAD", shell=True, cwd=workspace, capture_output=True, text=True)
+            curr_b = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=workspace, capture_output=True, text=True, timeout=30, env=exec_env)
             original_branch = curr_b.stdout.strip()
-            subprocess.run(f"git checkout -b {safety_branch}", shell=True, cwd=workspace, capture_output=True)
-        except Exception:
-            pass
+            cb_res = subprocess.run(["git", "checkout", "-b", safety_branch], cwd=workspace, capture_output=True, text=True, timeout=30, env=exec_env)
+            if cb_res.returncode != 0:
+                git_errors.append(f"git checkout -b failed: {cb_res.stderr.strip()}")
+        except Exception as ge:
+            git_errors.append(f"git safety net error: {str(ge)}")
 
     # 2. Giai đoạn 1: Architect / Requirement Clarification & Acceptance Criteria
     existing_files = []
     for root, dirs, files in os.walk(workspace):
-        dirs[:] = [d for d in dirs if d not in [".git", "__pycache__", "node_modules", "venv", ".venv"]]
-        for f in files:
+        dirs[:] = sorted([d for d in dirs if d not in [".git", "__pycache__", "node_modules", "venv", ".venv"]])
+        for f in sorted(files):
             existing_files.append(os.path.relpath(os.path.join(root, f), workspace))
             if len(existing_files) >= 50:
                 break
@@ -839,14 +1151,6 @@ def deepseek_code_task(
     test_passed = False
     last_test_output = ""
     loop_telemetry = []
-    
-    venv_bin = os.path.dirname(sys.executable)
-    sensitive_keywords = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH")
-    exec_env = {
-        k: v for k, v in os.environ.items()
-        if not any(kw in k.upper() for kw in sensitive_keywords)
-    }
-    exec_env["PATH"] = f"{venv_bin}:{exec_env.get('PATH', '')}"
 
     for turn in range(max_turns):
         turns_executed += 1
@@ -864,15 +1168,15 @@ def deepseek_code_task(
         if not msg.tool_calls:
             # Model declares completion or gives text
             if test_cmd:
-                test_exec = subprocess.run(test_cmd, shell=True, cwd=workspace, capture_output=True, text=True, timeout=90, env=exec_env)
-                last_test_output = test_exec.stdout + test_exec.stderr
-                if test_exec.returncode == 0:
+                test_out, test_rc, test_flag = _run_capped(test_cmd, workspace, exec_env, timeout=90)
+                last_test_output = test_out
+                if test_rc == 0:
                     test_passed = True
                     break
                 else:
                     messages.append({
                         "role": "user",
-                        "content": f"Automated test verification FAILED with exit code {test_exec.returncode}:\n{last_test_output}\nFix the code to make tests pass."
+                        "content": f"Automated test verification FAILED with exit code {test_rc}:\n{last_test_output}\nFix the code to make tests pass."
                     })
                     continue
             else:
@@ -885,22 +1189,35 @@ def deepseek_code_task(
                 fn_args = json.loads(tool_call.function.arguments)
             except Exception:
                 fn_args = {}
-            tool_output = execute_local_tool(workspace, fn_name, fn_args)
+            try:
+                tool_output = execute_local_tool(workspace, fn_name, fn_args)
+            except Exception as te:
+                tool_output = f"Tool execution error: {str(te)}"
+
+            str_out = str(tool_output)
+            if len(str_out) > MAX_TOOL_RESULT:
+                str_out = str_out[:MAX_TOOL_RESULT] + f"\n<<OUTPUT TRUNCATED AT {MAX_TOOL_RESULT} CHARS>>"
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "content": str(tool_output)
+                "content": str_out
             })
 
-    # 4. Thu thập Git Diff (Bao gồm cả file mới tạo thông qua git add -A)
+    # 4. Thu thập Git Diff an toàn
     git_diff = ""
     if is_git:
         try:
-            subprocess.run("git add -A", shell=True, cwd=workspace, capture_output=True)
-            diff_res = subprocess.run("git diff --cached", shell=True, cwd=workspace, capture_output=True, text=True)
+            add_res = subprocess.run(["git", "add", "-A"], cwd=workspace, capture_output=True, text=True, timeout=30, env=exec_env)
+            if add_res.returncode != 0:
+                git_errors.append(f"git add failed: {add_res.stderr.strip()}")
+            diff_res = subprocess.run(
+                ["git", "--no-pager", "diff", "--cached", "--no-ext-diff", "--no-textconv"],
+                cwd=workspace, capture_output=True, text=True, timeout=30, env=exec_env, errors="replace"
+            )
             git_diff = diff_res.stdout
-        except Exception:
-            pass
+        except Exception as de:
+            git_errors.append(f"git diff error: {str(de)}")
 
     # 5. Giai đoạn 3: Adversarial Review trên Git Diff (nếu có diff và bật option)
     adversarial_report = None
@@ -925,6 +1242,7 @@ def deepseek_code_task(
             "output_snippet": last_test_output[:2000] if last_test_output else "No test command run"
         },
         "git_diff_summary": git_diff[:3000] if git_diff else "No uncommitted git diff",
+        "git_errors": git_errors if git_errors else None,
         "adversarial_review": json.loads(adversarial_report) if adversarial_report else "Skipped",
         "telemetry_summary": {
             "architect_tokens": arch_telemetry,
@@ -937,6 +1255,7 @@ def deepseek_code_task(
 # Tool 4: deepseek_health (Kiểm tra kết nối và token)
 # ---------------------------------------------------------------------------
 @server.tool()
+@tool_guard
 def deepseek_health() -> str:
     """Kiểm tra tình trạng kết nối tới DeepSeek API, độ trễ và tính hợp lệ của API Key."""
     client = get_client()

@@ -1,5 +1,7 @@
 import os
 import sys
+import time
+import json
 import tempfile
 import pytest
 
@@ -123,15 +125,108 @@ def test_path_safety_denylist():
         safe, _ = is_safe_path(tmpdir, "certificate.pem")
         assert safe is False
 
-def test_read_file_size_limit():
+def test_read_file_single_large_line():
+    """Kiểm tra đọc file 1 dòng duy nhất có kích thước 2MB mà không bị OOM hay treo."""
     with tempfile.TemporaryDirectory() as tmpdir:
-        large_file = os.path.join(tmpdir, "large.txt")
-        # Create a file slightly larger than 2MB
-        with open(large_file, "wb") as f:
-            f.write(b"0" * (2 * 1024 * 1024 + 1024))
+        large_line_file = os.path.join(tmpdir, "oneline.txt")
+        # Tạo file 1 dòng duy nhất dài 1MB
+        with open(large_line_file, "w", encoding="utf-8") as f:
+            f.write("A" * (1024 * 1024))
 
-        res = execute_local_tool(tmpdir, "read_file", {"path": "large.txt"})
-        assert "vượt quá giới hạn dung lượng 2MB" in res
+        start = time.time()
+        res = execute_local_tool(tmpdir, "read_file", {"path": "oneline.txt"})
+        elapsed = time.time() - start
+
+        assert elapsed < 2.0
+        data = json.loads(res)
+        assert data["truncated"] is True
+        assert len(data["content"]) <= 256 * 1024
+
+def test_read_file_vietnamese_paging():
+    """Kiểm tra phân trang qua next_start_line trên file tiếng Việt không bị lỗi font mojibake."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        test_file = os.path.join(tmpdir, "vietnamese.txt")
+        lines = [
+            "Dòng 1: Xin chào thế giới từ DeepSeek MCP\n",
+            "Dòng 2: Phản biện kiến trúc Doubt-Driven Development\n",
+            "Dòng 3: Tối ưu hoá bộ đệm KV Cache và viễn trắc trung thực\n",
+            "Dòng 4: Không over-engineer, giữ vững nguyên tắc Karpathy\n"
+        ]
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+        # Đọc 2 dòng đầu
+        res1 = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "vietnamese.txt", "start_line": 1, "line_count": 2}))
+        assert res1["start_line"] == 1
+        assert res1["end_line"] == 2
+        assert res1["next_start_line"] == 3
+        assert res1["truncated"] is True
+        assert "Xin chào thế giới" in res1["content"]
+
+        # Đọc tiếp 2 dòng sau qua next_start_line
+        res2 = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "vietnamese.txt", "start_line": res1["next_start_line"], "line_count": 2}))
+        assert res2["start_line"] == 3
+        assert res2["end_line"] == 4
+        assert res2["eof"] is True
+        assert "Không over-engineer" in res2["content"]
+        assert "\ufffd" not in res1["content"] and "\ufffd" not in res2["content"]
+
+def test_read_file_fifo_pipe():
+    """Kiểm tra chặn FIFO pipe ngay lập tức mà không bao giờ mở file gây treo socket MCP."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fifo_path = os.path.join(tmpdir, "test_fifo")
+        os.mkfifo(fifo_path)
+
+        start = time.time()
+        res = execute_local_tool(tmpdir, "read_file", {"path": "test_fifo"})
+        elapsed = time.time() - start
+
+        assert elapsed < 1.0  # Không bị block/treo
+        data = json.loads(res)
+        assert data["code"] == "E_NOT_REGULAR"
+
+def test_read_file_bad_args():
+    """Kiểm tra xử lý đối số dị dạng (start_line là string hoặc âm, line_count là 0)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        fpath = os.path.join(tmpdir, "dummy.txt")
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write("line 1\nline 2\n")
+
+        res1 = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "dummy.txt", "start_line": "1", "line_count": 0}))
+        assert res1["start_line"] == 1
+
+        res2 = json.loads(execute_local_tool(tmpdir, "read_file", {"path": "dummy.txt", "start_line": -5, "line_count": "invalid"}))
+        assert res2["start_line"] == 1
+
+def test_path_safety_case_insensitive():
+    """Kiểm tra chặn bypass chữ hoa/thường trên hệ thống file như macOS APFS."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        safe, _ = is_safe_path(tmpdir, ".GIT/hooks/pre-commit")
+        assert safe is False
+        safe, _ = is_safe_path(tmpdir, ".Git/config")
+        assert safe is False
+        safe, _ = is_safe_path(tmpdir, ".VENV/bin/python")
+        assert safe is False
+
+def test_run_shell_yes_kill_fast():
+    """Kiểm tra lệnh nhả output vô tận (yes) bị kill tức thì khi chạm 128KB, không chờ 90s."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        start = time.time()
+        res = execute_local_tool(tmpdir, "run_shell", {"command": "yes"})
+        elapsed = time.time() - start
+
+        assert elapsed < 5.0
+        assert "OUTPUT TRUNCATED" in res
+
+def test_run_shell_non_utf8_bytes():
+    """Kiểm tra lệnh in byte không hợp lệ UTF-8 không làm crash UnicodeDecodeError."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        res = execute_local_tool(
+            tmpdir,
+            "run_shell",
+            {"command": "printf '\\xff\\xfe\\xfd'"}
+        )
+        assert "Exit code:" in res
 
 def test_run_shell_env_scrubbing():
     with tempfile.TemporaryDirectory() as tmpdir:

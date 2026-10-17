@@ -38,6 +38,13 @@ def test_read_only_tools_schema_isolation():
     ro_tool_names = [t["function"]["name"] for t in READ_ONLY_TOOLS_SCHEMA]
     assert "read_file" in ro_tool_names
     assert "list_files" in ro_tool_names
+
+    read_tool = next(t for t in READ_ONLY_TOOLS_SCHEMA if t["function"]["name"] == "read_file")
+    props = read_tool["function"]["parameters"]["properties"]
+    assert "path" in props
+    assert "start_line" in props
+    assert "line_count" in props
+
     # Ensure mutating tools are strictly forbidden in read-only schema
     assert "write_file" not in ro_tool_names
     assert "edit_file_replace" not in ro_tool_names
@@ -95,7 +102,7 @@ def test_ask_session_lifecycle():
     assert not os.path.exists(file_path)
     assert load_session(session_id) is None
     
-    # 5. Clear all sessions tool (with 'all' and None)
+    # 5. Clear all sessions tool (with explicit 'all' and rejection on None)
     save_session("s1", {"messages": [], "updated_at": 2000000000.0})
     save_session("s2", {"messages": [], "updated_at": 2000000000.0})
     clear_all_res = json.loads(deepseek_session_clear("all"))
@@ -104,8 +111,19 @@ def test_ask_session_lifecycle():
     assert load_session("s2") is None
 
     save_session("s3", {"messages": [], "updated_at": 2000000000.0})
+    # None or empty must be rejected with E_BAD_ARG to prevent accidental total wipeout
     clear_none_res = json.loads(deepseek_session_clear(None))
-    assert clear_none_res["status"] == "SUCCESS"
+    assert clear_none_res["status"] == "ERROR"
+    assert clear_none_res["code"] == "E_BAD_ARG"
+    assert load_session("s3") is not None
+
+    clear_empty_res = json.loads(deepseek_session_clear("  "))
+    assert clear_empty_res["status"] == "ERROR"
+    assert clear_empty_res["code"] == "E_BAD_ARG"
+    assert load_session("s3") is not None
+
+    clear_all_res2 = json.loads(deepseek_session_clear("all"))
+    assert clear_all_res2["status"] == "SUCCESS"
     assert load_session("s3") is None
 
     # Test namespace collision prevention
@@ -127,6 +145,41 @@ def test_list_files_schema_and_execution_alias():
     files = json.loads(out)
     assert isinstance(files, list)
     assert "server.py" in files or "README.md" in files
+
+def test_session_lock_concurrency():
+    import json
+    from server import session_lock, SessionBusyError, deepseek_ask
+    
+    session_id = "test-lock-concurrency"
+    
+    with session_lock(session_id):
+        # Trying to acquire the same session lock must immediately raise SessionBusyError
+        with pytest.raises(SessionBusyError):
+            with session_lock(session_id):
+                pass
+        
+        # Calling deepseek_ask with the busy session must return E_SESSION_BUSY envelope
+        res_raw = deepseek_ask(prompt="hello", session_id=session_id)
+        res = json.loads(res_raw)
+        assert res["status"] == "ERROR"
+        assert res["error"]["code"] == "E_SESSION_BUSY"
+        assert "đang được xử lý" in res["error"]["message"]
+
+def test_test_cmd_guardrail_rejected(tmp_path):
+    import json
+    from server import deepseek_code_task
+    
+    ws = str(tmp_path)
+    res_raw = deepseek_code_task(
+        workspace_dir=ws,
+        task="Testing safety rejection",
+        test_cmd="rm -rf /"
+    )
+    res = json.loads(res_raw)
+    assert res["status"] == "ERROR"
+    assert res["error"]["code"] == "E_CMD_REJECTED"
+    assert "Safety Guardrail" in res["error"]["message"]
+
 
 
 
