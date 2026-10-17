@@ -300,14 +300,36 @@ def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX
     start_search = 1 if has_system else 0
 
     user_indices = [i for i in range(start_search, len(messages)) if messages[i].get("role") == "user"]
+    if not user_indices:
+        pruned = messages
+    else:
+        # Tối ưu O(1) full serialization bằng ước lượng kích thước theo tổng hậu tố (suffix sum)
+        msg_lens = [len(json.dumps(m, ensure_ascii=False)) for m in messages]
+        suffix_sum = [0] * (len(messages) + 1)
+        for i in range(len(messages) - 1, -1, -1):
+            suffix_sum[i] = suffix_sum[i + 1] + msg_lens[i]
 
-    pruned = messages
-    for idx in user_indices:
-        candidate = system_prefix + messages[idx:]
-        c_json = json.dumps({"messages": candidate}, ensure_ascii=False, indent=2)
-        if len(c_json.encode("utf-8")) <= budget:
-            return candidate
-        pruned = candidate
+        sys_len = msg_lens[0] if has_system else 0
+        target_idx = None
+        for idx in user_indices:
+            # Dự trù thêm 20% overhead cho indentation và wrapper
+            if (sys_len + suffix_sum[idx]) * 1.2 <= budget:
+                target_idx = idx
+                break
+
+        if target_idx is not None:
+            candidate = system_prefix + messages[target_idx:]
+            if len(json.dumps({"messages": candidate}, ensure_ascii=False, indent=2).encode("utf-8")) <= budget:
+                return candidate
+            # Nếu do indent vượt nhẹ budget, duyệt tiếp các user turn kế tiếp
+            start_pos = user_indices.index(target_idx) + 1
+            for next_idx in user_indices[start_pos:]:
+                cand = system_prefix + messages[next_idx:]
+                if len(json.dumps({"messages": cand}, ensure_ascii=False, indent=2).encode("utf-8")) <= budget:
+                    return cand
+            pruned = system_prefix + messages[user_indices[-1]:]
+        else:
+            pruned = system_prefix + messages[user_indices[-1]:]
 
     # Nếu đã cắt hết các lượt cũ mà vẫn vượt budget, truncate content của các tin nhắn quá dài
     c_bytes = len(json.dumps({"messages": pruned}, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -573,8 +595,8 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
             break
         time.sleep(0.05)
 
-    # C1: Ưu tiên timeout > capped để chống nuốt timeout khi kill_on_cap=False
-    if time.monotonic() > deadline:
+    # C1: Ưu tiên timeout > capped để chống nuốt timeout khi kill_on_cap=False (chỉ khi process chưa thoát)
+    if time.monotonic() > deadline and proc.poll() is None:
         flag = "timeout"
     elif state["capped"]:
         flag = "capped"
@@ -771,11 +793,16 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         try:
             dir_name = os.path.dirname(full_path)
             os.makedirs(dir_name, exist_ok=True)
-            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8", newline="") as tf:
                 temp_p = tf.name
                 tf.write(content)
                 tf.flush()
                 os.fsync(tf.fileno())
+            if os.path.exists(full_path):
+                try:
+                    os.chmod(temp_p, stat.S_IMODE(os.stat(full_path).st_mode))
+                except OSError:
+                    pass
             os.replace(temp_p, full_path)
             temp_p = None
             return f"Successfully wrote {len(content)} characters to '{rel_path}'."
@@ -805,7 +832,7 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         temp_p = None
         try:
             try:
-                with open(full_path, "r", encoding="utf-8") as f:
+                with open(full_path, "r", encoding="utf-8", newline="") as f:
                     current_text = f.read()
             except UnicodeDecodeError:
                 return f"Error: File '{rel_path}' không phải định dạng UTF-8 hợp lệ, từ chối chỉnh sửa để chống hỏng dữ liệu."
@@ -817,11 +844,16 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                 return f"Error: search_block xuất hiện {count} lần trong file. Phải cung cấp thêm ngữ cảnh xung quanh để xác định duy nhất."
             new_text = current_text.replace(search_block, replace_block, 1)
             dir_name = os.path.dirname(full_path)
-            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8", newline="") as tf:
                 temp_p = tf.name
                 tf.write(new_text)
                 tf.flush()
                 os.fsync(tf.fileno())
+            if os.path.exists(full_path):
+                try:
+                    os.chmod(temp_p, stat.S_IMODE(os.stat(full_path).st_mode))
+                except OSError:
+                    pass
             os.replace(temp_p, full_path)
             temp_p = None
             return f"Successfully replaced search block in '{rel_path}'."

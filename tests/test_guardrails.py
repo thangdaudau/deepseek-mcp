@@ -368,23 +368,70 @@ def test_edit_file_replace_rejects_non_utf8():
         with open(bad_file, "rb") as f:
             assert f.read() == b"caf\xe9 resume\n"
 
-def test_write_and_edit_tempfile_cleanup_on_error():
-    """Kiểm tra N4: tempfile tự dọn dẹp sạch sẽ khi gặp lỗi, không rò rỉ vào workspace."""
+def test_write_and_edit_tempfile_cleanup_on_error(monkeypatch):
+    """Kiểm tra N4: tempfile tự dọn dẹp sạch sẽ trong khối finally khi os.replace gặp lỗi."""
     from server import execute_local_tool
     with tempfile.TemporaryDirectory() as tmpdir:
-        # 1. Edit file với search_block không tồn tại -> không tạo/rò rỉ tempfile
-        test_file = os.path.join(tmpdir, "sample.txt")
-        with open(test_file, "w", encoding="utf-8") as f:
-            f.write("hello world\n")
+        # Giả lập lỗi ở bước os.replace khi gọi write_file
+        def fail_replace(src, dst):
+            raise OSError("Simulated disk failure during replace")
+            
+        monkeypatch.setattr(os, "replace", fail_replace)
+        
+        res = execute_local_tool(tmpdir, "write_file", {
+            "path": "target.txt",
+            "content": "hello atomic write",
+        })
+        assert "Simulated disk failure during replace" in res
+        # Bắt buộc không có bất kỳ file tạm (NamedTemporaryFile) nào còn sót lại
+        assert os.listdir(tmpdir) == []
+
+def test_file_permissions_preserved_on_write_and_edit():
+    """Kiểm tra R1: atomic write bảo toàn chmod (như executable 0o755) của file gốc."""
+    import stat
+    from server import execute_local_tool
+    with tempfile.TemporaryDirectory() as tmpdir:
+        script_path = os.path.join(tmpdir, "deploy.sh")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/bash\necho deploy\n")
+        os.chmod(script_path, 0o755)
+        
+        # 1. Test edit_file_replace
+        res = execute_local_tool(tmpdir, "edit_file_replace", {
+            "path": "deploy.sh",
+            "search_block": "echo deploy",
+            "replace_block": "echo release",
+        })
+        assert "Successfully replaced" in res
+        mode = stat.S_IMODE(os.stat(script_path).st_mode)
+        assert mode == 0o755
+
+        # 2. Test write_file overwriting existing file
+        res = execute_local_tool(tmpdir, "write_file", {
+            "path": "deploy.sh",
+            "content": "#!/bin/bash\necho v2\n",
+        })
+        assert "Successfully wrote" in res
+        mode = stat.S_IMODE(os.stat(script_path).st_mode)
+        assert mode == 0o755
+
+def test_edit_file_replace_preserves_crlf():
+    """Kiểm tra R2: edit_file_replace giữ nguyên định dạng CRLF (\\r\\n), không bị ép thành LF."""
+    from server import execute_local_tool
+    with tempfile.TemporaryDirectory() as tmpdir:
+        crlf_file = os.path.join(tmpdir, "windows.txt")
+        with open(crlf_file, "wb") as f:
+            f.write(b"line1\r\nline2\r\nline3\r\n")
             
         res = execute_local_tool(tmpdir, "edit_file_replace", {
-            "path": "sample.txt",
-            "search_block": "not_found_block",
-            "replace_block": "bar",
+            "path": "windows.txt",
+            "search_block": "line2",
+            "replace_block": "line2_modified",
         })
-        assert "Error: search_block không tìm thấy" in res
-        files = os.listdir(tmpdir)
-        assert files == ["sample.txt"]
+        assert "Successfully replaced" in res
+        with open(crlf_file, "rb") as f:
+            content = f.read()
+            assert content == b"line1\r\nline2_modified\r\nline3\r\n"
 
 def test_session_pruning_turn_boundary():
     """Kiểm tra N2/N3: _prune_session_messages bảo tồn turn boundary (bắt đầu bằng 'user'), không để orphan 'tool' message."""
