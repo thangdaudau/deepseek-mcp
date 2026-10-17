@@ -327,7 +327,7 @@ def cleanup_expired_sessions() -> None:
     now = time.time()
     try:
         for fname in os.listdir(SESSIONS_DIR):
-            if fname.endswith(".json") or fname.endswith(".lock") or fname.startswith("tmp"):
+            if fname.endswith(".json") or fname.startswith("tmp"):
                 fpath = os.path.join(SESSIONS_DIR, fname)
                 try:
                     if now - os.path.getmtime(fpath) > SESSION_TTL_SECONDS:
@@ -580,7 +580,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
     out = []
     tail = b""
     line_no = 0
-    used = 0
+    emitted_bytes = 0
     next_start = None
     truncated = False
 
@@ -592,13 +592,9 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
             f.seek(0)
 
             while True:
-                if used >= MAX_READ_BYTES:
-                    truncated = True
-                    break
-                chunk = f.read(min(CHUNK_SIZE, MAX_READ_BYTES - used))
+                chunk = f.read(CHUNK_SIZE)
                 if not chunk:
                     break
-                used += len(chunk)
                 tail += chunk
 
                 parts = tail.split(b"\n")
@@ -609,33 +605,44 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
                     line_no += 1
                     if line_no < start:
                         continue
-                    if len(out) >= want:
+                    if len(out) >= want or (out and emitted_bytes + len(raw) > MAX_READ_BYTES):
                         next_start = line_no
                         truncated = True
                         stop = True
                         break
                     out.append(raw.decode("utf-8", errors="replace") + "\n")
+                    emitted_bytes += len(raw) + 1
                 if stop:
+                    break
+
+                # Chặn trường hợp 1 dòng đơn lẻ dài vượt trần MAX_READ_BYTES không có dấu \n
+                if len(tail) >= MAX_READ_BYTES:
+                    truncated = True
                     break
 
             if not truncated and tail:
                 line_no += 1
                 if line_no >= start:
-                    if len(out) >= want:
+                    if len(out) >= want or (out and emitted_bytes + len(tail) > MAX_READ_BYTES):
                         next_start = line_no
                         truncated = True
                     else:
                         out.append(tail.decode("utf-8", errors="replace"))
+                        emitted_bytes += len(tail)
     except Exception as e:
         return json.dumps({"status": "ERROR", "code": "E_READ_FAILED", "message": str(e)}, ensure_ascii=False)
 
-    # Nếu chạm trần byte MAX_READ_BYTES mà không đọc được dòng hoàn chỉnh nào (ví dụ dòng đầu tiên > 256KB)
+    # Chống mâu thuẫn envelope khi chạm EOF đúng biên
+    if truncated and not out and not tail:
+        truncated = False
+
+    # Nếu chạm trần byte MAX_READ_BYTES mà không đọc được dòng hoàn chỉnh nào (dòng đơn lẻ > 256KB)
     if truncated and not out and tail:
         sample = tail[:2000].decode("utf-8", errors="replace")
         return json.dumps({
             "status": "ERROR",
             "code": "E_LINE_TOO_LONG",
-            "message": f"Dòng thứ {start} của '{rel_path}' dài vượt quá trần an toàn ({MAX_READ_BYTES} bytes, minified code hoặc JSON đơn dòng). Hãy dùng run_shell với lệnh 'head -c {MAX_READ_BYTES} ...' để bóc tách.",
+            "message": f"Dòng thứ {max(start, line_no + 1)} của '{rel_path}' dài vượt quá trần an toàn ({MAX_READ_BYTES} bytes, minified code hoặc JSON đơn dòng). Hãy dùng run_shell với lệnh 'head -c {MAX_READ_BYTES} ...' để bóc tách.",
             "path": rel_path,
             "start_line": start,
             "file_size": st.st_size,
@@ -658,7 +665,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
         "truncated": truncated,
         "eof": eof,
         "file_size": st.st_size,
-        "bytes_returned": used,
+        "bytes_returned": emitted_bytes,
         "next_step": f"call read_file with start_line={next_start}" if next_start else None,
         "content": body
     }, ensure_ascii=False)

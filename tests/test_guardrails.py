@@ -273,3 +273,46 @@ def test_run_capped_non_killing_test_runner():
         assert "OUTPUT TRUNCATED" in out
         assert len(out) >= 128 * 1024
 
+def test_read_file_deep_offset_beyond_256kb():
+    """Kiểm tra đọc file tại offset sâu (dòng 7000 trên file 800KB) không bị false E_LINE_TOO_LONG."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filepath = os.path.join(tmpdir, "deep_file.txt")
+        lines = [f"Line {str(i).zfill(6)}: " + "A" * 30 + "\n" for i in range(1, 20001)]
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+
+        res_raw = execute_local_tool(tmpdir, "read_file", {"path": "deep_file.txt", "start_line": 7000, "line_count": 100})
+        res = json.loads(res_raw)
+        assert res.get("status") != "ERROR"
+        assert res["start_line"] == 7000
+        assert "Line 007000" in res["content"]
+        assert len(res["content"]) > 0
+
+def test_read_file_full_file_reconstruction_property():
+    """Property test: Đọc lặp qua nhiều trang tới EOF trên file 1MB, ghép lại phải khớp 100% bản gốc."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        filepath = os.path.join(tmpdir, "large_source.txt")
+        # Tạo file ~1MB gồm 15.000 dòng
+        original_lines = [f"Dòng {i}: Test nội dung tiếng Việt có dấu và mã nguồn Python def func_{i}(): return {i}\n" for i in range(1, 15001)]
+        original_text = "".join(original_lines)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(original_text)
+
+        reconstructed_parts = []
+        cur_start = 1
+        turns = 0
+
+        while cur_start is not None and turns < 50:
+            turns += 1
+            res_raw = execute_local_tool(tmpdir, "read_file", {"path": "large_source.txt", "start_line": cur_start})
+            data = json.loads(res_raw)
+            reconstructed_parts.append(data["content"])
+            if data["eof"]:
+                break
+            cur_start = data["next_start_line"]
+
+        reconstructed_text = "".join(reconstructed_parts)
+        assert reconstructed_text == original_text
+        assert turns > 1  # Đảm bảo đã thực sự phân qua nhiều trang
+
+
