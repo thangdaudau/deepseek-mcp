@@ -273,6 +273,57 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
             return None
     return None
 
+def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX_SESSION_BYTES) -> List[Dict[str, Any]]:
+    """
+    Tỉa tin nhắn lịch sử đảm bảo:
+    1. Giữ nguyên messages[0] nếu là system prompt.
+    2. Cắt theo ranh giới lượt hội thoại hoàn chỉnh (User Turn Boundary, role == 'user')
+       để tuyệt đối không bao giờ để lại orphan 'tool' message gây lỗi 400 Bad Request trên API.
+    3. Giảm kích thước UTF-8 xuống dưới max_bytes.
+    4. Nếu ngay cả turn gần nhất vẫn vượt quá max_bytes, truncate nội dung text của message dài nhất.
+    """
+    if not messages:
+        return []
+    if len(messages) <= 1:
+        return messages
+
+    # Ngân sách an toàn trừ hao 2KB cho metadata khác của session
+    budget = max(1024, max_bytes - 2048)
+
+    # Kiểm tra kích thước hiện tại
+    current_json = json.dumps({"messages": messages}, ensure_ascii=False, indent=2)
+    if len(current_json.encode("utf-8")) <= budget:
+        return messages
+
+    has_system = messages[0].get("role") == "system"
+    system_prefix = [messages[0]] if has_system else []
+    start_search = 1 if has_system else 0
+
+    user_indices = [i for i in range(start_search, len(messages)) if messages[i].get("role") == "user"]
+
+    pruned = messages
+    for idx in user_indices:
+        candidate = system_prefix + messages[idx:]
+        c_json = json.dumps({"messages": candidate}, ensure_ascii=False, indent=2)
+        if len(c_json.encode("utf-8")) <= budget:
+            return candidate
+        pruned = candidate
+
+    # Nếu đã cắt hết các lượt cũ mà vẫn vượt budget, truncate content của các tin nhắn quá dài
+    c_bytes = len(json.dumps({"messages": pruned}, ensure_ascii=False, indent=2).encode("utf-8"))
+    if c_bytes > budget:
+        pruned_copy = [dict(m) for m in pruned]
+        pruned = pruned_copy
+        for msg in reversed(pruned):
+            content = msg.get("content")
+            if isinstance(content, str) and len(content) > 10000:
+                msg["content"] = content[:10000] + "\n<<MESSAGE CONTENT TRUNCATED DUE TO SIZE LIMIT>>"
+                c_bytes = len(json.dumps({"messages": pruned}, ensure_ascii=False, indent=2).encode("utf-8"))
+                if c_bytes <= budget:
+                    break
+
+    return pruned
+
 def save_session(session_id: str, data: Dict[str, Any]) -> bool:
     """Ghi bền vững và nguyên tử (atomic write) session xuống file JSON trên đĩa, enforce trần MAX_SESSION_BYTES."""
     file_path = get_session_file(session_id)
@@ -280,13 +331,11 @@ def save_session(session_id: str, data: Dict[str, Any]) -> bool:
     os.makedirs(dir_name, exist_ok=True)
     temp_path = None
     try:
+        # Nếu session có messages, tỉa theo ranh giới turn boundary hợp lệ trước khi serialize
+        if "messages" in data and isinstance(data["messages"], list):
+            data["messages"] = _prune_session_messages(data["messages"], MAX_SESSION_BYTES)
+
         payload = json.dumps(data, ensure_ascii=False, indent=2)
-        # Nếu payload vượt quá trần MAX_SESSION_BYTES (8MB), tỉa bớt tin nhắn lịch sử cũ
-        if len(payload.encode("utf-8")) > MAX_SESSION_BYTES:
-            msgs = data.get("messages", [])
-            if len(msgs) > 10:
-                data["messages"] = [msgs[0]] + msgs[-8:]
-                payload = json.dumps(data, ensure_ascii=False, indent=2)
 
         with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
             temp_path = tf.name   # Gán NGAY trước khi ghi, chống leak file nếu fail
@@ -483,6 +532,7 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
             stderr=subprocess.STDOUT,
             start_new_session=True,  # Tạo process group riêng để kill toàn bộ cây tiến trình
         )
+        pgid = proc.pid
     except Exception as e:
         return f"Process spawn error: {str(e)}", -1, "error"
 
@@ -532,7 +582,7 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
     # Chỉ kill khi timeout hoặc khi chạm cap với kill_on_cap=True
     if proc.poll() is None and (flag == "timeout" or (flag == "capped" and kill_on_cap)):
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -540,13 +590,13 @@ def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            os.killpg(pgid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
 
     # C2: Đảm bảo dọn sạch các tiến trình con cháu (orphaned grandchildren) tránh rò rỉ pipe
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
 
@@ -717,6 +767,7 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
             st = os.stat(full_path)
             if not stat.S_ISREG(st.st_mode):
                 return f"Error: '{rel_path}' không phải regular file (chặn FIFO / device file)."
+        temp_p = None
         try:
             dir_name = os.path.dirname(full_path)
             os.makedirs(dir_name, exist_ok=True)
@@ -726,9 +777,16 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                 tf.flush()
                 os.fsync(tf.fileno())
             os.replace(temp_p, full_path)
+            temp_p = None
             return f"Successfully wrote {len(content)} characters to '{rel_path}'."
         except Exception as e:
             return f"Error writing file: {str(e)}"
+        finally:
+            if temp_p and os.path.exists(temp_p):
+                try:
+                    os.remove(temp_p)
+                except Exception:
+                    pass
             
     elif name == "edit_file_replace":
         rel_path = args.get("path", "")
@@ -744,9 +802,14 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
             return f"Error: '{rel_path}' không phải regular file (chặn FIFO / device file)."
         if st.st_size > 5 * 1024 * 1024:
             return f"Error: File '{rel_path}' quá lớn ({st.st_size} bytes > 5MB), không hỗ trợ replace trực tiếp."
+        temp_p = None
         try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                current_text = f.read()
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    current_text = f.read()
+            except UnicodeDecodeError:
+                return f"Error: File '{rel_path}' không phải định dạng UTF-8 hợp lệ, từ chối chỉnh sửa để chống hỏng dữ liệu."
+
             if search_block not in current_text:
                 return f"Error: search_block không tìm thấy trong file '{rel_path}'."
             count = current_text.count(search_block)
@@ -760,9 +823,16 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                 tf.flush()
                 os.fsync(tf.fileno())
             os.replace(temp_p, full_path)
+            temp_p = None
             return f"Successfully replaced search block in '{rel_path}'."
         except Exception as e:
             return f"Error editing file: {str(e)}"
+        finally:
+            if temp_p and os.path.exists(temp_p):
+                try:
+                    os.remove(temp_p)
+                except Exception:
+                    pass
             
     elif name == "run_shell":
         cmd = args.get("command", "")

@@ -349,5 +349,76 @@ def test_env_scrubbing_preserves_ssh_auth_sock():
         else:
             os.environ.pop("MY_API_KEY", None)
 
+def test_edit_file_replace_rejects_non_utf8():
+    """Kiểm tra N1: edit_file_replace từ chối file non-UTF8 bằng strict encoding, chống hỏng dữ liệu."""
+    from server import execute_local_tool
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bad_file = os.path.join(tmpdir, "latin1.txt")
+        # Byte 0xe9 trong ISO-8859-1 (ký tự é), không hợp lệ trong UTF-8 đơn lẻ
+        with open(bad_file, "wb") as f:
+            f.write(b"caf\xe9 resume\n")
+            
+        res = execute_local_tool(tmpdir, "edit_file_replace", {
+            "path": "latin1.txt",
+            "search_block": "caf",
+            "replace_block": "tea",
+        })
+        assert "không phải định dạng UTF-8 hợp lệ" in res
+        # File gốc phải còn nguyên vẹn, không bị đè bởi \ufffd
+        with open(bad_file, "rb") as f:
+            assert f.read() == b"caf\xe9 resume\n"
+
+def test_write_and_edit_tempfile_cleanup_on_error():
+    """Kiểm tra N4: tempfile tự dọn dẹp sạch sẽ khi gặp lỗi, không rò rỉ vào workspace."""
+    from server import execute_local_tool
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # 1. Edit file với search_block không tồn tại -> không tạo/rò rỉ tempfile
+        test_file = os.path.join(tmpdir, "sample.txt")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("hello world\n")
+            
+        res = execute_local_tool(tmpdir, "edit_file_replace", {
+            "path": "sample.txt",
+            "search_block": "not_found_block",
+            "replace_block": "bar",
+        })
+        assert "Error: search_block không tìm thấy" in res
+        files = os.listdir(tmpdir)
+        assert files == ["sample.txt"]
+
+def test_session_pruning_turn_boundary():
+    """Kiểm tra N2/N3: _prune_session_messages bảo tồn turn boundary (bắt đầu bằng 'user'), không để orphan 'tool' message."""
+    from server import _prune_session_messages
+    
+    # Giả lập lịch sử với 2 turn hoàn chỉnh chứa tool calls
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        # Turn 1 (dài 10KB để dễ vượt budget)
+        {"role": "user", "content": "Query 1: " + ("A" * 10000)},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "file contents 1"},
+        {"role": "assistant", "content": "Answer 1."},
+        # Turn 2
+        {"role": "user", "content": "Query 2."},
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call_2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "call_2", "content": "file contents 2"},
+        {"role": "assistant", "content": "Answer 2."},
+    ]
+    
+    # Thiết lập max_bytes nhỏ (ví dụ 8KB) để buộc phải prune Turn 1
+    pruned = _prune_session_messages(messages, max_bytes=8192)
+    
+    # 1. messages[0] luôn là system prompt
+    assert pruned[0]["role"] == "system"
+    # 2. Tin nhắn tiếp theo PHẢI là 'user' (Turn 2), TUYỆT ĐỐI không phải orphan 'tool' hay assistant tool call
+    assert pruned[1]["role"] == "user"
+    assert pruned[1]["content"] == "Query 2."
+    # 3. Các tin nhắn tool trong Turn 2 được giữ nguyên vẹn
+    roles = [m["role"] for m in pruned]
+    assert roles == ["system", "user", "assistant", "tool", "assistant"]
+    assert pruned[3]["role"] == "tool"
+    assert pruned[3]["tool_call_id"] == "call_2"
+    assert pruned[2]["tool_calls"][0]["id"] == "call_2"
+
 
 
