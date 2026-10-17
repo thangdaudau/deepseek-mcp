@@ -415,6 +415,15 @@ def test_file_permissions_preserved_on_write_and_edit():
         mode = stat.S_IMODE(os.stat(script_path).st_mode)
         assert mode == 0o755
 
+        # 3. Test write_file creating a brand-new file gets standard 0o644 (R1b)
+        res = execute_local_tool(tmpdir, "write_file", {
+            "path": "new_file.txt",
+            "content": "brand new file",
+        })
+        assert "Successfully wrote" in res
+        new_mode = stat.S_IMODE(os.stat(os.path.join(tmpdir, "new_file.txt")).st_mode)
+        assert new_mode == 0o644
+
 def test_edit_file_replace_preserves_crlf():
     """Kiểm tra R2: edit_file_replace giữ nguyên định dạng CRLF (\\r\\n), không bị ép thành LF."""
     from server import execute_local_tool

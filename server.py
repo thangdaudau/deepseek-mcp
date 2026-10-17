@@ -23,7 +23,6 @@ from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 from openai import OpenAI
-from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # Configuration & Constants
@@ -37,6 +36,9 @@ CHUNK_SIZE = 64 * 1024            # 64KB chunk streaming
 MAX_TOOL_RESULT = 32_000          # 32,000 chars per-tool-call cap in messages
 MAX_SESSION_BYTES = 8 * 1024 * 1024 # 8MB max session JSON on disk
 MAX_SHELL_OUT = 128 * 1024        # 128KB output cap for shell commands
+
+# Khóa chặt bất biến: MAX_READ_BYTES + envelope dự trù luôn phải nhỏ hơn trần MAX_TOOL_RESULT
+assert MAX_READ_BYTES <= MAX_TOOL_RESULT - 4096, "MAX_READ_BYTES must leave room for JSON envelope in MAX_TOOL_RESULT"
 
 DANGEROUS_COMMAND_PATTERNS = [
     r"\brm\s+.*(-[a-zA-Z0-9]*[rfRF]|--recursive|--force).*\s+(/|~|\$HOME|\*|/\*)(\s|$)",
@@ -303,8 +305,8 @@ def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX
     if not user_indices:
         pruned = messages
     else:
-        # Tối ưu O(1) full serialization bằng ước lượng kích thước theo tổng hậu tố (suffix sum)
-        msg_lens = [len(json.dumps(m, ensure_ascii=False)) for m in messages]
+        # Tối ưu O(1) full serialization bằng ước lượng kích thước theo byte UTF-8 và tổng hậu tố (suffix sum)
+        msg_lens = [len(json.dumps(m, ensure_ascii=False).encode("utf-8")) for m in messages]
         suffix_sum = [0] * (len(messages) + 1)
         for i in range(len(messages) - 1, -1, -1):
             suffix_sum[i] = suffix_sum[i + 1] + msg_lens[i]
@@ -312,8 +314,8 @@ def _prune_session_messages(messages: List[Dict[str, Any]], max_bytes: int = MAX
         sys_len = msg_lens[0] if has_system else 0
         target_idx = None
         for idx in user_indices:
-            # Dự trù thêm 20% overhead cho indentation và wrapper
-            if (sys_len + suffix_sum[idx]) * 1.2 <= budget:
+            # Dự trù thêm 50% overhead cho indentation và wrapper
+            if (sys_len + suffix_sum[idx]) * 1.5 <= budget:
                 target_idx = idx
                 break
 
@@ -435,7 +437,7 @@ READ_ONLY_TOOLS_SCHEMA = [
                 "properties": {
                     "path": {"type": "string", "description": "Đường dẫn file tương đối trong workspace"},
                     "start_line": {"type": "integer", "description": "Dòng bắt đầu đọc (1-indexed, mặc định: 1)"},
-                    "line_count": {"type": "integer", "description": "Số dòng cần đọc tối đa (mặc định: đọc tối đa 2000 dòng hoặc tới 256KB)"}
+                    "line_count": {"type": "integer", "description": "Số dòng cần đọc tối đa (mặc định: đọc tối đa 2000 dòng hoặc tới 24KB)"}
                 },
                 "required": ["path"]
             }
@@ -737,7 +739,7 @@ def _read_file_envelope(workspace: str, rel_path: str, start_line: Any = 1, line
     if truncated and not out and not tail:
         truncated = False
 
-    # Nếu chạm trần byte MAX_READ_BYTES mà không đọc được dòng hoàn chỉnh nào (dòng đơn lẻ > 256KB)
+    # Nếu chạm trần byte MAX_READ_BYTES mà không đọc được dòng hoàn chỉnh nào (dòng đơn lẻ > 24KB)
     if truncated and not out and tail:
         sample = tail[:2000].decode("utf-8", errors="replace")
         return json.dumps({
@@ -801,6 +803,11 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
             if os.path.exists(full_path):
                 try:
                     os.chmod(temp_p, stat.S_IMODE(os.stat(full_path).st_mode))
+                except OSError:
+                    pass
+            else:
+                try:
+                    os.chmod(temp_p, 0o644)
                 except OSError:
                     pass
             os.replace(temp_p, full_path)
