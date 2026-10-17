@@ -95,13 +95,23 @@ def test_ask_session_lifecycle():
     assert not os.path.exists(file_path)
     assert load_session(session_id) is None
     
-    # 5. Clear all sessions tool
+    # 5. Clear all sessions tool (with 'all' and None)
     save_session("s1", {"messages": [], "updated_at": 2000000000.0})
     save_session("s2", {"messages": [], "updated_at": 2000000000.0})
-    clear_all_res = json.loads(deepseek_session_clear(None))
+    clear_all_res = json.loads(deepseek_session_clear("all"))
     assert clear_all_res["status"] == "SUCCESS"
     assert load_session("s1") is None
     assert load_session("s2") is None
+
+    save_session("s3", {"messages": [], "updated_at": 2000000000.0})
+    clear_none_res = json.loads(deepseek_session_clear(None))
+    assert clear_none_res["status"] == "SUCCESS"
+    assert load_session("s3") is None
+
+    # Test namespace collision prevention
+    f1 = get_session_file("conv/1")
+    f2 = get_session_file("conv_1")
+    assert f1 != f2, "Collision: conv/1 and conv_1 must resolve to distinct session files"
 
 def test_list_files_schema_and_execution_alias():
     from server import READ_ONLY_TOOLS_SCHEMA, execute_local_tool

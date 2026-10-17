@@ -90,3 +90,60 @@ def test_local_tool_execution():
         # 4. List files
         files_json = execute_local_tool(tmpdir, "list_files", {})
         assert "hello.py" in files_json
+
+def test_path_safety_denylist():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # .git protection (RCE prevention)
+        safe, _ = is_safe_path(tmpdir, ".git/hooks/pre-commit")
+        assert safe is False
+        safe, _ = is_safe_path(tmpdir, ".git/config")
+        assert safe is False
+
+        # .venv protection
+        safe, _ = is_safe_path(tmpdir, ".venv/bin/python")
+        assert safe is False
+
+        # .env protection (sensitive configs)
+        safe, _ = is_safe_path(tmpdir, ".env")
+        assert safe is False
+        safe, _ = is_safe_path(tmpdir, ".env.production")
+        assert safe is False
+        safe, _ = is_safe_path(tmpdir, ".env.local")
+        assert safe is False
+
+        # Allowed templates
+        safe, _ = is_safe_path(tmpdir, ".env.example")
+        assert safe is True
+        safe, _ = is_safe_path(tmpdir, ".env.template")
+        assert safe is True
+
+        # Private keys and certificates
+        safe, _ = is_safe_path(tmpdir, "id_rsa.key")
+        assert safe is False
+        safe, _ = is_safe_path(tmpdir, "certificate.pem")
+        assert safe is False
+
+def test_read_file_size_limit():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        large_file = os.path.join(tmpdir, "large.txt")
+        # Create a file slightly larger than 2MB
+        with open(large_file, "wb") as f:
+            f.write(b"0" * (2 * 1024 * 1024 + 1024))
+
+        res = execute_local_tool(tmpdir, "read_file", {"path": "large.txt"})
+        assert "vượt quá giới hạn dung lượng 2MB" in res
+
+def test_run_shell_env_scrubbing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        os.environ["TEST_SECRET_KEY"] = "super-secret-123"
+        os.environ["DATABASE_AUTH_PASSWORD"] = "pass-456"
+        try:
+            res = execute_local_tool(
+                tmpdir,
+                "run_shell",
+                {"command": 'python3 -c "import os; print(\'TEST_SECRET_KEY\' in os.environ, \'DATABASE_AUTH_PASSWORD\' in os.environ)"'}
+            )
+            assert "False False" in res
+        finally:
+            os.environ.pop("TEST_SECRET_KEY", None)
+            os.environ.pop("DATABASE_AUTH_PASSWORD", None)

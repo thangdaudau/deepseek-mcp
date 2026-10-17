@@ -11,6 +11,8 @@ import json
 import re
 import time
 import subprocess
+import hashlib
+import tempfile
 from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 
@@ -25,16 +27,16 @@ DEFAULT_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 DEFAULT_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 DANGEROUS_COMMAND_PATTERNS = [
-    r"\brm\s+-[a-zA-Z0-9]*[rfRF][a-zA-Z0-9]*\s+(/|~|\$HOME)(\s|$)",
-    r"\brm\s+-[a-zA-Z0-9]*[rfRF][a-zA-Z0-9]*\s+\*(\s|$)",
+    r"\brm\s+.*(-[a-zA-Z0-9]*[rfRF]|--recursive|--force).*\s+(/|~|\$HOME|\*)(\s|$)",
     r"\bmkfs(\.[a-z0-9]+)?(\s|$)",
-    r"\bdd\s+if=",
+    r"\bdd\s+.*(if=|of=/dev/)",
     r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:",
-    r"\bgit\s+push\s+.*--force\b",
+    r"\bgit\s+push\s+.*(-f\b|--force\b)",
+    r"\bfind\s+.*-delete\b",
     r"\bshutdown(\s|$)",
     r"\breboot(\s|$)",
     r"\bpoweroff(\s|$)",
-    r"\b(chmod|chown)\s+-[rR]\s+777\s+(/|~)(\s|$)"
+    r"\b(chmod|chown)\s+-[rR]\s+.*(/|~)(\s|$)"
 ]
 
 server = MCPServer("DeepSeek-MCP")
@@ -65,15 +67,32 @@ def get_client() -> OpenAI:
     api_key = get_api_key()
     if not api_key:
         raise ValueError("Lỗi: Chưa tìm thấy DEEPSEEK_API_KEY trong env hoặc ~/.local/share/deepseek-mcp/.env!")
-    return OpenAI(api_key=api_key, base_url=DEFAULT_BASE_URL)
+    return OpenAI(api_key=api_key, base_url=DEFAULT_BASE_URL, timeout=120.0, max_retries=2)
 
 def is_safe_path(base_dir: str, target_path: str) -> Tuple[bool, str]:
-    """Kiểm tra chặn Path Traversal ra ngoài workspace."""
+    """Kiểm tra chặn Path Traversal ra ngoài workspace và denylist các đường dẫn nhạy cảm."""
     base = os.path.realpath(base_dir)
     target = os.path.realpath(os.path.join(base, target_path))
-    if target == base or target.startswith(base + os.sep):
-        return True, target
-    return False, target
+    if not (target == base or target.startswith(base + os.sep)):
+        return False, target
+
+    rel = os.path.relpath(target, base)
+    parts = Path(rel).parts
+
+    # Chặn truy cập .git (chống RCE qua hooks/config) và .venv (chống can thiệp virtualenv binary)
+    if any(p in (".git", ".venv") for p in parts):
+        return False, target
+
+    filename = parts[-1].lower() if parts else ""
+    # Chặn file .env nhạy cảm (cho phép .env.example, .env.template, .env.sample)
+    if filename == ".env" or (filename.startswith(".env.") and not filename.endswith((".example", ".template", ".sample"))):
+        return False, target
+
+    # Chặn private keys và certificates
+    if filename.endswith((".pem", ".key", ".p12", ".pfx")):
+        return False, target
+
+    return True, target
 
 def check_command_safety(command: str) -> Tuple[bool, Optional[str]]:
     """Kiểm tra lệnh nguy hiểm trong blacklist."""
@@ -120,9 +139,10 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 SESSION_TTL_SECONDS = 86400  # 24 hours (1 ngày)
 
 def get_session_file(session_id: str) -> str:
-    """Tạo đường dẫn an toàn cho session file, chặn path traversal."""
-    safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)
-    return os.path.join(SESSIONS_DIR, f"{safe_id}.json")
+    """Tạo đường dẫn an toàn cho session file, chặn path traversal và chống va chạm namespace."""
+    safe_prefix = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)[:32]
+    id_hash = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(SESSIONS_DIR, f"{safe_prefix}_{id_hash}.json")
 
 def load_session(session_id: str) -> Optional[Dict[str, Any]]:
     """Tải session từ đĩa, tự hủy nếu quá hạn TTL."""
@@ -140,13 +160,23 @@ def load_session(session_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def save_session(session_id: str, data: Dict[str, Any]) -> None:
-    """Ghi bền vững session xuống file JSON trên đĩa."""
+    """Ghi bền vững và nguyên tử (atomic write) session xuống file JSON trên đĩa."""
     file_path = get_session_file(session_id)
+    dir_name = os.path.dirname(file_path)
+    temp_path = None
     try:
-        with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile("w", dir=dir_name, delete=False, encoding="utf-8") as tf:
+            json.dump(data, tf, ensure_ascii=False, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+            temp_path = tf.name
+        os.replace(temp_path, file_path)
     except Exception:
-        pass
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
 
 def delete_session(session_id: str) -> bool:
     """Xóa file session chỉ định trên đĩa."""
@@ -311,6 +341,8 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
             return f"Error: Path '{rel_path}' nằm ngoài workspace!"
         if not os.path.exists(full_path):
             return f"Error: File '{rel_path}' không tồn tại."
+        if os.path.isfile(full_path) and os.path.getsize(full_path) > 2 * 1024 * 1024:
+            return f"Error: File '{rel_path}' vượt quá giới hạn dung lượng 2MB."
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
@@ -361,9 +393,13 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
         if not safe:
             return f"Command Rejected by Safety Guardrail: {reason}"
         try:
+            sensitive_keywords = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH")
+            scrubbed_env = {
+                k: v for k, v in os.environ.items()
+                if not any(kw in k.upper() for kw in sensitive_keywords)
+            }
             venv_bin = os.path.dirname(sys.executable)
-            env = os.environ.copy()
-            env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
+            scrubbed_env["PATH"] = f"{venv_bin}:{scrubbed_env.get('PATH', '')}"
             res = subprocess.run(
                 cmd,
                 shell=True,
@@ -371,7 +407,7 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                 capture_output=True,
                 text=True,
                 timeout=90,
-                env=env
+                env=scrubbed_env
             )
             out = res.stdout + ("\n--- STDERR ---\n" + res.stderr if res.stderr else "")
             return f"Exit code: {res.returncode}\n{out[:4000]}"
@@ -400,6 +436,7 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                         break
                 if len(files_list) >= 100:
                     break
+            files_list.sort()
             return json.dumps(files_list[:100], indent=2)
         except Exception as e:
             return f"Error listing files: {str(e)}"
@@ -628,16 +665,17 @@ def deepseek_session_clear(session_id: Optional[str] = None) -> str:
     Xóa bỏ một hoặc toàn bộ session lưu ngữ cảnh multi-turn của deepseek_ask trên đĩa.
     
     Args:
-        session_id: ID của session cần xóa. Nếu None, xóa toàn bộ session trên đĩa.
+        session_id: ID của session cần xóa. Nếu None hoặc 'all', xóa toàn bộ session trên đĩa.
     """
-    if session_id:
-        deleted = delete_session(session_id)
-        if deleted:
-            return json.dumps({"status": "SUCCESS", "message": f"Session '{session_id}' đã được xóa khỏi đĩa."}, ensure_ascii=False)
-        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{session_id}' không tồn tại trên đĩa."}, ensure_ascii=False)
-    else:
+    if session_id is None or session_id.strip().lower() == "all":
         count = delete_all_sessions()
         return json.dumps({"status": "SUCCESS", "message": f"Đã xóa toàn bộ {count} sessions trên đĩa."}, ensure_ascii=False)
+    else:
+        sid = session_id.strip()
+        deleted = delete_session(sid)
+        if deleted:
+            return json.dumps({"status": "SUCCESS", "message": f"Session '{sid}' đã được xóa khỏi đĩa."}, ensure_ascii=False)
+        return json.dumps({"status": "NOT_FOUND", "message": f"Session '{sid}' không tồn tại trên đĩa."}, ensure_ascii=False)
 
 
 
@@ -757,6 +795,8 @@ def deepseek_code_task(
             existing_files.append(os.path.relpath(os.path.join(root, f), workspace))
             if len(existing_files) >= 50:
                 break
+        if len(existing_files) >= 50:
+            break
 
     arch_system = (
         "You are an Elite Software Architect. Your sole mission is to analyze requirements and lay down an exact, concrete execution blueprint for the Coder.\n"
@@ -801,7 +841,11 @@ def deepseek_code_task(
     loop_telemetry = []
     
     venv_bin = os.path.dirname(sys.executable)
-    exec_env = os.environ.copy()
+    sensitive_keywords = ("KEY", "TOKEN", "SECRET", "PASS", "CREDENTIAL", "AUTH")
+    exec_env = {
+        k: v for k, v in os.environ.items()
+        if not any(kw in k.upper() for kw in sensitive_keywords)
+    }
     exec_env["PATH"] = f"{venv_bin}:{exec_env.get('PATH', '')}"
 
     for turn in range(max_turns):
