@@ -671,6 +671,16 @@ def serialize_assistant_message(msg: Any) -> Dict[str, Any]:
         } for i, tc in enumerate(tool_calls)]
     return d
 
+def sanitize_messages_for_api(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Loại bỏ reasoning_content khỏi messages trước khi gửi lên API để tiết kiệm input tokens."""
+    cleaned = []
+    for m in messages:
+        if m.get("role") == "assistant" and "reasoning_content" in m:
+            cleaned.append({k: v for k, v in m.items() if k != "reasoning_content"})
+        else:
+            cleaned.append(m)
+    return cleaned
+
 def _run_capped(cmd: str, cwd: str, env: dict, timeout: int = 90, cap: int = MAX_SHELL_OUT, kill_on_cap: bool = True) -> Tuple[str, int, str]:
     """
     Thực thi shell command với process group riêng biệt, streaming output có trần và kill tức thời khi chạm trần (nếu kill_on_cap=True).
@@ -1009,7 +1019,20 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                 return f"Error: File '{rel_path}' không phải định dạng UTF-8 hợp lệ, từ chối chỉnh sửa để chống hỏng dữ liệu."
 
             if search_block not in current_text:
-                # Fallback: Chỉ bóc tách tiền tố số dòng khi 100% dòng bắt đầu ở Column 0 và tăng dần liên tục (Contiguity Gate)
+                # Fallback 1: Chuẩn hóa line-ending nếu có lệch CRLF (\r\n) vs LF (\n)
+                if "\r\n" in current_text and "\r\n" not in search_block:
+                    crlf_search = search_block.replace("\r\n", "\n").replace("\n", "\r\n")
+                    if crlf_search in current_text:
+                        search_block = crlf_search
+                        replace_block = replace_block.replace("\r\n", "\n").replace("\n", "\r\n")
+                elif "\r\n" not in current_text and "\r\n" in search_block:
+                    lf_search = search_block.replace("\r\n", "\n")
+                    if lf_search in current_text:
+                        search_block = lf_search
+                        replace_block = replace_block.replace("\r\n", "\n")
+
+            if search_block not in current_text:
+                # Fallback 2: Chỉ bóc tách tiền tố số dòng khi 100% dòng bắt đầu ở Column 0 và tăng dần liên tục (Contiguity Gate)
                 s_lines = search_block.splitlines(keepends=True)
                 s_nums = []
                 s_rests = []
@@ -1030,6 +1053,16 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                     expected_run = list(range(s_nums[0], s_nums[0] + len(s_nums)))
                     if s_nums == expected_run:
                         candidate = "".join(s_rests)
+                        if candidate not in current_text:
+                            if "\r\n" in current_text and "\r\n" not in candidate:
+                                cand_crlf = candidate.replace("\r\n", "\n").replace("\n", "\r\n")
+                                if cand_crlf in current_text:
+                                    candidate = cand_crlf
+                            elif "\r\n" not in current_text and "\r\n" in candidate:
+                                cand_lf = candidate.replace("\r\n", "\n")
+                                if cand_lf in current_text:
+                                    candidate = cand_lf
+
                         if candidate in current_text:
                             search_block = candidate
                             # Kiểm tra an toàn cho replace_block: CHỈ strip nếu 100% dòng cũng khớp numbering hợp lệ
@@ -1051,6 +1084,10 @@ def execute_local_tool(workspace: str, name: str, args: Dict[str, Any]) -> str:
                                 r_expected = list(range(r_nums[0], r_nums[0] + len(r_nums)))
                                 if r_nums == r_expected:
                                     replace_block = "".join(r_rests)
+                                    if "\r\n" in current_text and "\r\n" not in replace_block:
+                                        replace_block = replace_block.replace("\r\n", "\n").replace("\n", "\r\n")
+                                    elif "\r\n" not in current_text and "\r\n" in replace_block:
+                                        replace_block = replace_block.replace("\r\n", "\n")
 
             if search_block not in current_text:
                 return f"Error: search_block không tìm thấy trong file '{rel_path}'."
@@ -1204,7 +1241,7 @@ def deepseek_ask(
             
         kwargs: Dict[str, Any] = {
             "model": DEFAULT_MODEL,
-            "messages": messages,
+            "messages": sanitize_messages_for_api(messages),
         }
         
         if thinking:
@@ -1227,6 +1264,7 @@ def deepseek_ask(
                 kwargs["tools"] = READ_ONLY_TOOLS_SCHEMA
                 for _ in range(max_tool_turns):
                     tool_turns_executed += 1
+                    kwargs["messages"] = sanitize_messages_for_api(messages)
                     response = client.chat.completions.create(**kwargs)
                     msg = response.choices[0].message
                     all_telemetry.append(extract_telemetry(response.usage))
@@ -1274,7 +1312,7 @@ def deepseek_ask(
                     })
                     kwargs_final = {
                         "model": DEFAULT_MODEL,
-                        "messages": messages,
+                        "messages": sanitize_messages_for_api(messages),
                         "extra_body": kwargs.get("extra_body", {}),
                         "reasoning_effort": kwargs.get("reasoning_effort", "none")
                     }
@@ -1560,7 +1598,7 @@ def deepseek_code_task(
         turns_executed += 1
         res = client.chat.completions.create(
             model=DEFAULT_MODEL,
-            messages=messages,
+            messages=sanitize_messages_for_api(messages),
             tools=LOCAL_TOOLS_SCHEMA,
             extra_body={"thinking": {"type": "disabled"}}, # Non-thinking mode for fast, precise tool calls
             reasoning_effort="none"

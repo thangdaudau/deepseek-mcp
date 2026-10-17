@@ -726,5 +726,77 @@ def test_read_file_envelope_empty_file(tmp_path):
     assert res["eof"] is True
 
 
+def test_sanitize_messages_for_api_strips_reasoning_content():
+    """Kiểm tra loại bỏ reasoning_content khỏi messages trước khi gửi API nhưng không làm đột biến dữ liệu gốc."""
+    from server import sanitize_messages_for_api
+    
+    messages = [
+        {"role": "system", "content": "You are an assistant."},
+        {"role": "user", "content": "Hello"},
+        {
+            "role": "assistant",
+            "content": "Hi there!",
+            "reasoning_content": "Internal thought process that must not be sent back to API",
+            "tool_calls": []
+        },
+        {"role": "user", "content": "How are you?"}
+    ]
+    
+    cleaned = sanitize_messages_for_api(messages)
+    
+    assert len(cleaned) == 4
+    assert cleaned[0] == messages[0]
+    assert cleaned[1] == messages[1]
+    assert "reasoning_content" not in cleaned[2]
+    assert cleaned[2]["content"] == "Hi there!"
+    assert cleaned[2]["tool_calls"] == []
+    # Bản gốc không bị biến đổi (immutability)
+    assert "reasoning_content" in messages[2]
 
 
+def test_edit_file_replace_crlf_lf_cross_normalization(tmp_path):
+    """Kiểm tra edit_file_replace chuẩn hóa hai chiều giữa CRLF (\r\n) và LF (\n) và bảo toàn line-ending của file gốc."""
+    from server import execute_local_tool
+    
+    # Trường hợp 1: File gốc có CRLF (\r\n), nhưng search_block truyền vào dùng LF (\n)
+    crlf_file = tmp_path / "crlf.txt"
+    crlf_file.write_bytes(b"line 1\r\nline 2\r\nline 3\r\n")
+    
+    res1 = execute_local_tool(str(tmp_path), "edit_file_replace", {
+        "path": "crlf.txt",
+        "search_block": "line 2\n",
+        "replace_block": "line 2 modified\n"
+    })
+    assert "Successfully replaced" in res1
+    content1 = crlf_file.read_bytes()
+    assert b"line 2 modified\r\n" in content1
+    assert b"\r\n" in content1
+    assert b"line 1\r\nline 2 modified\r\nline 3\r\n" == content1
+    
+    # Trường hợp 2: File gốc có LF (\n), nhưng search_block truyền vào dùng CRLF (\r\n)
+    lf_file = tmp_path / "lf.txt"
+    lf_file.write_bytes(b"alpha\nbeta\ngamma\n")
+    
+    res2 = execute_local_tool(str(tmp_path), "edit_file_replace", {
+        "path": "lf.txt",
+        "search_block": "beta\r\n",
+        "replace_block": "beta updated\r\n"
+    })
+    assert "Successfully replaced" in res2
+    content2 = lf_file.read_bytes()
+    assert b"beta updated\n" in content2
+    assert b"\r\n" not in content2
+    assert b"alpha\nbeta updated\ngamma\n" == content2
+
+    # Trường hợp 3: Fallback số dòng với CRLF
+    numbered_crlf = tmp_path / "numbered.txt"
+    numbered_crlf.write_bytes(b"foo\r\nbar\r\nbaz\r\n")
+    
+    res3 = execute_local_tool(str(tmp_path), "edit_file_replace", {
+        "path": "numbered.txt",
+        "search_block": "2: bar\n",
+        "replace_block": "2: bar_new\n"
+    })
+    assert "Successfully replaced" in res3
+    content3 = numbered_crlf.read_bytes()
+    assert b"foo\r\nbar_new\r\nbaz\r\n" == content3
