@@ -28,27 +28,49 @@ def test_path_safety_sandbox():
         assert safe is False
 
 def test_command_blacklist_guardrail():
-    # Dangerous commands
-    safe, reason = check_command_safety("rm -rf /")
-    assert safe is False
-    assert "Guardrail" in reason
-
-    safe, reason = check_command_safety("rm -rf *")
-    assert safe is False
-
-    safe, reason = check_command_safety("dd if=/dev/zero of=/dev/sda")
-    assert safe is False
-
-    safe, reason = check_command_safety("git push origin main --force")
-    assert safe is False
+    # Dangerous commands - Chặn 100% mọi lệnh xóa
+    delete_commands = [
+        "rm file.txt",
+        "rm -f a.out",
+        "rm -rf /",
+        "rm -rf *",
+        "rm -rf ~",
+        "rm -rf ~/projects",
+        "rm -rf /etc/nginx",
+        "/bin/rm -rf /tmp/test",
+        "env rm -f foo.txt",
+        "rmdir mydir",
+        "/usr/bin/rmdir empty_dir",
+        "unlink file.txt",
+        "shred -u secret.txt",
+        "git clean -fdx",
+        "git rm test.py",
+        "find . -name '*.pyc' -delete",
+        "dd if=/dev/zero of=/dev/sda",
+        "git push origin main --force",
+    ]
+    for cmd in delete_commands:
+        safe, reason = check_command_safety(cmd)
+        assert safe is False, f"Lệnh '{cmd}' đáng lẽ phải bị chặn nhưng lại lọt!"
+        assert "Guardrail" in reason
 
     # Safe commands
-    safe, reason = check_command_safety("pytest tests/test_code.py")
-    assert safe is True
-    assert reason is None
-
-    safe, reason = check_command_safety("npm run build")
-    assert safe is True
+    safe_commands = [
+        "pytest tests/test_code.py",
+        "pytest tests/rm.py",
+        "npm run build",
+        "python format_code.py",
+        "python perform_task.py",
+        "git status",
+        "git diff",
+        "git commit -m 'remove old code'",
+        "git checkout -b new-branch",
+        "cargo build --release",
+    ]
+    for cmd in safe_commands:
+        safe, reason = check_command_safety(cmd)
+        assert safe is True, f"Lệnh an toàn '{cmd}' bị chặn nhầm!"
+        assert reason is None
 
 def test_extract_telemetry():
     class DummyUsage:
@@ -126,7 +148,7 @@ def test_path_safety_denylist():
         assert safe is False
 
 def test_read_file_single_large_line():
-    """Kiểm tra đọc file 1 dòng duy nhất có kích thước 1MB trả về E_LINE_TOO_LONG, không OOM, không loop vô tận."""
+    """Kiểm tra đọc file 1 dòng duy nhất có kích thước 1MB qua byte_offset: không OOM, không loop vô tận, đọc mượt mà."""
     with tempfile.TemporaryDirectory() as tmpdir:
         large_line_file = os.path.join(tmpdir, "oneline.txt")
         # Tạo file 1 dòng duy nhất dài 1MB (không chứa dấu xuống dòng)
@@ -139,10 +161,10 @@ def test_read_file_single_large_line():
 
         assert elapsed < 2.0
         data = json.loads(res)
-        assert data["status"] == "ERROR"
-        assert data["code"] == "E_LINE_TOO_LONG"
-        assert "vượt quá trần an toàn" in data["message"]
-        assert len(data["partial_content"]) > 0
+        assert data["status"] == "OK"
+        assert data["truncated"] is True
+        assert data["next_byte_offset"] == 24576
+        assert len(data["content"]) > 0
 
 def test_read_file_multi_large_lines_paging():
     """Kiểm tra file nhiều dòng dài chạm byte cap (24KB): next_start_line trỏ đúng dòng kế tiếp, không bị None."""
@@ -262,15 +284,17 @@ def test_run_shell_env_scrubbing():
             os.environ.pop("DATABASE_AUTH_PASSWORD", None)
 
 def test_run_capped_non_killing_test_runner():
-    """Kiểm tra _run_capped với kill_on_cap=False (dành cho TDD test runner) cho phép tiến trình chạy hết và trả exit code 0."""
+    """Kiểm tra _run_capped với kill_on_cap=False bảo toàn cả Head và Tail (chuẩn Google preview) và exit code 0."""
     from server import _run_capped
     with tempfile.TemporaryDirectory() as tmpdir:
-        # Lệnh in 200KB output (> 128KB cap) rồi exit 0
-        cmd = 'python3 -c "import sys; sys.stdout.write(\'X\' * 200000); sys.exit(0)"'
+        # Lệnh in 200KB output (> 128KB cap) có marker ở đầu và cuối rồi exit 0
+        cmd = 'python3 -c "import sys; sys.stdout.write(\'HEAD_DISCOVERY_MARKER\\n\' + \'X\' * 200000 + \'\\nTAIL_PYTEST_FAILED_TRACEBACK\'); sys.exit(0)"'
         out, rc, flag = _run_capped(cmd, tmpdir, os.environ.copy(), timeout=10, cap=128 * 1024, kill_on_cap=False)
         assert rc == 0
         assert flag == "capped"
         assert "OUTPUT TRUNCATED" in out
+        assert "HEAD_DISCOVERY_MARKER" in out
+        assert "TAIL_PYTEST_FAILED_TRACEBACK" in out
         assert len(out) >= 128 * 1024
 
 def test_read_file_deep_offset_beyond_256kb():
@@ -368,8 +392,8 @@ def test_run_capped_hang_with_capped_output():
         assert flag == "timeout"
         assert "COMMAND TIMED OUT" in out
 
-def test_env_scrubbing_preserves_ssh_auth_sock():
-    """Kiểm tra C5: build_scrubbed_env tẩy sạch secret token nhưng bảo toàn SSH_AUTH_SOCK cho git-over-ssh."""
+def test_env_scrubbing_strips_ssh_agent():
+    """Kiểm tra: build_scrubbed_env tẩy sạch secret token VÀ loại bỏ SSH_AUTH_SOCK/SSH_AGENT_PID để cô lập môi trường."""
     from server import build_scrubbed_env
     old_val = os.environ.get("SSH_AUTH_SOCK")
     old_secret = os.environ.get("MY_API_KEY")
@@ -377,7 +401,7 @@ def test_env_scrubbing_preserves_ssh_auth_sock():
         os.environ["SSH_AUTH_SOCK"] = "/tmp/ssh-agent.sock"
         os.environ["MY_API_KEY"] = "sk-secret-123456"
         env = build_scrubbed_env()
-        assert env.get("SSH_AUTH_SOCK") == "/tmp/ssh-agent.sock"
+        assert "SSH_AUTH_SOCK" not in env
         assert "MY_API_KEY" not in env
     finally:
         if old_val:

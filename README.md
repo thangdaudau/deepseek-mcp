@@ -1,56 +1,134 @@
 # DeepSeek MCP Server
 
-Hệ thống MCP Server tích hợp DeepSeek-Flash (V4.1), hỗ trợ Thinking Mode (CoT) linh hoạt, TDD test runner tự động và cơ chế phản biện gắt Doubt-Driven Development.
+MCP Server tích hợp mô hình **DeepSeek-Flash** (ngữ cảnh 1M tokens), cung cấp bộ công cụ mạnh mẽ cho AI Agent và lập trình viên: điều tra codebase tự hành, tự động lập trình theo chu trình TDD và phản biện độc lập Doubt-Driven Development.
 
-## Vị trí cài đặt
-- **Mã nguồn Server:** `~/.local/share/deepseek-mcp/server.py`
-- **Môi trường ảo (venv):** `~/.local/share/deepseek-mcp/venv/`
-- **Cấu hình API Key:** `~/.local/share/deepseek-mcp/.env`
-- **Cấu hình Antigravity MCP:** `~/.gemini/config/mcp_config.json`
+---
 
-## Danh sách công cụ (MCP Tools)
+## 1. Cấu hình nhanh
+
+### Bước 1: Khai báo API Key
+Tạo hoặc chỉnh sửa file `~/.local/share/deepseek-mcp/.env`:
+```bash
+DEEPSEEK_API_KEY="sk-your-deepseek-api-key"
+DEEPSEEK_MODEL="deepseek-flash"
+DEEPSEEK_BASE_URL="https://api.deepseek.com"
+```
+
+### Bước 2: Đăng ký MCP Server
+Thêm cấu hình vào `~/.gemini/config/mcp_config.json`:
+```json
+{
+  "mcpServers": {
+    "deepseek": {
+      "command": "/home/peapea/.local/share/deepseek-mcp/venv/bin/python3",
+      "args": [
+        "/home/peapea/.local/share/deepseek-mcp/server.py"
+      ],
+      "env": {
+        "DEEPSEEK_MODEL": "deepseek-flash"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 2. Hướng dẫn sử dụng các MCP Tools
 
 ### 1. `deepseek_ask`
-Truy vấn DeepSeek-Flash hỗ trợ suy luận logic, phản biện đa hiệp (Multi-turn) và tự động khảo sát codebase:
-- `prompt` (string, required): Nội dung câu hỏi, lập luận phản biện hoặc yêu cầu điều tra.
-- `session_id` (string, optional): ID phiên làm việc để duy trì ngữ cảnh multi-turn bền vững trên đĩa (`~/.local/share/deepseek-mcp/sessions/<session_id>.json`). Khuyến nghị ghim Conversation ID của agent.
-- `reset_session` (bool, default `False`): Xóa sạch ngữ cảnh cũ của session và bắt đầu hội thoại mới.
-- `workspace_dir` (string, optional): Đường dẫn thư mục dự án / tài liệu. Khi cung cấp, kích hoạt vòng lặp Read-Only ReAct giúp DeepSeek tự hành gọi các tool `read_file` và `list_files` để bóc tách mã nguồn trực tiếp mà không cần copy paste nội dung file vào prompt.
-- `max_tool_turns` (int, default `5`): Số lượt gọi tool tối đa trong 1 truy vấn khảo sát.
-- `thinking` (bool, default `True`): Bật/tắt suy luận CoT.
-- `effort` (string: `'low'`, `'high'`, `'max'`, default `'high'`): Mức độ suy luận CoT.
-- `system_prompt` (string, optional): Chỉ dẫn hệ thống tĩnh để tối ưu KV Cache Prefix Matching.
+Dùng để suy luận logic sâu, hỏi đáp kỹ thuật, tranh luận nhiều hiệp hoặc tự động điều tra codebase.
+
+- **Các tham số:**
+  - `prompt` *(string, bắt buộc)*: Câu hỏi, luận điểm hoặc yêu cầu khảo sát.
+  - `workspace_dir` *(string, tùy chọn)*: Đường dẫn thư mục dự án. Khi cung cấp, DeepSeek được cấp quyền tự động gọi các công cụ đọc file (`read_file`, `list_files`, `search_file`) để tự tìm hiểu mã nguồn mà không cần copy-paste thủ công vào prompt.
+  - `session_id` *(string, tùy chọn)*: ID phiên làm việc để duy trì ngữ cảnh multi-turn bền vững. Khuyến nghị dùng Conversation ID của agent.
+  - `reset_session` *(bool, mặc định `False`)*: Xóa ngữ cảnh cũ của session và bắt đầu hội thoại mới.
+  - `max_tool_turns` *(int, mặc định `5`)*: Số lượt tự đọc file tối đa trong một lần điều tra.
+  - `thinking` *(bool, mặc định `True`)*: Bật/tắt chế độ suy luận CoT (Thinking mode).
+  - `effort` *(string: `'low'`, `'high'`, `'max'`, mặc định `'high'`)*: Mức độ đào sâu suy luận CoT.
+
+- **Ví dụ sử dụng:**
+  ```json
+  {
+    "prompt": "Find where authentication tokens are verified and check for potential expiration bypasses.",
+    "workspace_dir": "/path/to/my-project",
+    "session_id": "my-chat-session-01",
+    "effort": "high"
+  }
+  ```
+
+---
 
 ### 2. `deepseek_code_task`
-Tự động thực hiện chu trình: **Lập Spec (Architect CoT)** -> **Sửa file & chạy test (Coder ReAct)** -> **Tự phản biện (Doubt Gate)**:
-- `workspace_dir` (string, required): Đường dẫn tuyệt đối thư mục dự án.
-- `task` (string, required): Mô tả bài toán cần làm.
-- `test_cmd` (string, optional): Lệnh chạy test tự động (ví dụ: `pytest tests/test_perf.py`).
-- `thinking` (bool, default `True`): Dùng thinking mode cho Architect và Reviewer.
-- `effort` (string, default `'high'`): Mức độ suy luận CoT.
-- `run_adversarial_review` (bool, default `True`): Tự động thẩm định git diff sau khi test xanh.
-- `max_turns` (int, default `12`): Số lượt ReAct tối đa.
+Ủy thác cho DeepSeek tự động viết code và chạy test khép kín (TDD ReAct loop).
+
+- **Các tham số:**
+  - `workspace_dir` *(string, bắt buộc)*: Đường dẫn tuyệt đối của thư mục dự án.
+  - `task` *(string, bắt buộc)*: Mô tả chi tiết yêu cầu bài toán hoặc tính năng cần triển khai/sửa lỗi.
+  - `test_cmd` *(string, tùy chọn)*: Lệnh chạy test tự động (ví dụ: `pytest tests/test_auth.py` hoặc `npm test`).
+  - `thinking` *(bool, mặc định `True`)*: Bật suy luận cho giai đoạn Architect lập Spec.
+  - `effort` *(string, mặc định `'high'`)*: Mức độ suy luận.
+  - `max_turns` *(int, mặc định `12`)*: Giới hạn số lượt Coder ReAct sửa file và chạy test.
+
+- **Ví dụ sử dụng:**
+  ```json
+  {
+    "workspace_dir": "/path/to/my-project",
+    "task": "Thêm method validate_token(token) vào auth.py và đảm bảo test trong tests/test_auth.py pass.",
+    "test_cmd": "pytest tests/test_auth.py"
+  }
+  ```
+
+---
 
 ### 3. `deepseek_adversarial_review`
-Persona phản biện độc lập (Doubt-Driven) mang tâm thế "bác bỏ, tìm cách phá hỏng code":
-- `code_or_diff` (string, required): Đoạn code hoặc git diff cần audit.
-- `context_spec` (string, optional): Tài liệu yêu cầu / hợp đồng chức năng.
-- `effort` (string: `'high'` hoặc `'max'`, default `'high'`).
+Phản biện gắt mã nguồn hoặc Git Diff độc lập theo tinh thần Doubt-Driven Development (tìm lỗi race condition, memory leak, bypass logic, vỡ hợp đồng dữ liệu).
+
+- **Các tham số:**
+  - `workspace_dir` *(string, tùy chọn)*: Đường dẫn thư mục dự án. Server sẽ tự động thu thập Git Diff sạch và các file untracked để thẩm định.
+  - `context_spec` *(string, tùy chọn)*: Tài liệu đặc tả, yêu cầu kỹ thuật hoặc ràng buộc của bài toán.
+  - `code_or_diff` *(string, tùy chọn)*: Đoạn code hoặc Git Diff dán trực tiếp nếu không chỉ định `workspace_dir`.
+  - `effort` *(string: `'high'` hoặc `'max'`, mặc định `'max'`)*: Mức độ phản biện.
+
+- **Kết quả trả về:**
+  - Báo cáo lỗi chi tiết: Danh sách lỗ hổng tiềm ẩn kèm mức độ nghiêm trọng.
+  - **Tự động sinh Test đối kháng vật lý:** Nếu phát hiện lỗi, Reviewer sẽ tự động viết test case đối kháng, server tự động lưu file vào `<workspace>/.deepseek/adversarial/` và trả về lệnh `run_cmd` để chạy thử ngay lập tức (có cơ chế chống ghi đè an toàn).
+
+- **Ví dụ sử dụng:**
+  ```json
+  {
+    "workspace_dir": "/path/to/my-project",
+    "context_spec": "Hàm chuyển tiền phải đảm bảo thread-safe tuyệt đối, cấm race condition gây âm số dư.",
+    "effort": "max"
+  }
+  ```
+
+---
 
 ### 4. `deepseek_session_clear`
-Quản lý và giải phóng session trên đĩa:
-- `session_id` (string, optional): ID session cần xóa. Nếu truyền `"all"`, toàn bộ session cache sẽ được dọn sạch.
+Quản lý và giải phóng các session hội thoại multi-turn lưu trên đĩa.
+
+- **Các tham số:**
+  - `session_id` *(string, bắt buộc)*: ID của session cần xóa. Nếu truyền `"all"`, toàn bộ session trên đĩa sẽ được dọn sạch.
+
+---
 
 ### 5. `deepseek_health`
-Kiểm tra tình trạng kết nối tới DeepSeek API, đo latency và kiểm tra token.
+Kiểm tra tình trạng kết nối tới DeepSeek API, độ trễ mạng và tính hợp lệ của API Key.
 
-## Chốt chặn an toàn (Guardrails)
-1. **Workspace Boundary:** Chặn path traversal ra ngoài `workspace_dir`.
-2. **Command Blacklist:** Chặn các lệnh nguy hiểm (`rm -rf /`, `rm -rf *`, `mkfs`, `dd`, `git push --force`...).
-3. **Git Safety Net:** Tự động tạo branch tạm `deepseek/task-<timestamp>` trước khi sửa mã nguồn.
+- **Các tham số:** Không có tham số.
 
-## Kiểm thử
-Chạy toàn bộ 11 bài unit & live integration tests:
+---
+
+## 3. Chạy kiểm thử hệ thống
+
+Để kiểm tra toàn bộ hoạt động của MCP Server và các chốt chặn an toàn:
+
 ```bash
-~/.local/share/deepseek-mcp/venv/bin/pytest ~/.local/share/deepseek-mcp/tests/ -v
+# Chạy toàn bộ 47 unit & integration tests offline
+/home/peapea/.local/share/deepseek-mcp/venv/bin/pytest tests/test_hardened_v3.py tests/test_guardrails.py tests/test_mcp_server_tools.py -v
+
+# Chạy test thực chiến E2E gọi trực tiếp DeepSeek API (yêu cầu có mạng)
+/home/peapea/.local/share/deepseek-mcp/venv/bin/pytest tests/test_live_deepseek_integration.py -k test_live_coder_and_reviewer_adversarial_e2e -s -v
 ```
